@@ -1,0 +1,5 @@
+Flask==3.0.3
+Werkzeug==3.0.3
+# Pas de version épinglée volontairement : vérifiez la dernière version
+# stable sur https://pypi.org/project/libsql/ au moment du déploiement.
+libsql
