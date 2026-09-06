@@ -19,6 +19,15 @@ Le reste du code (`entreprise.py`, `minigithub.py`) est resté écrit en SQL
 la syntaxe Postgres quand c'est ce backend qui est actif. Vous n'avez donc
 rien à changer dans la logique métier existante.
 
+**Schéma dédié `corpsuite`** — toutes les tables de l'application sont
+créées dans un schéma Postgres dédié (`corpsuite`), pas dans `public`. Ça
+évite toute collision si la même base Neon est aussi utilisée par un autre
+projet à vous (par ex. si `users` existe déjà ailleurs avec un schéma
+incompatible). **Dans l'explorateur de tables de Neon (ou via `psql`),
+pensez à sélectionner le schéma `corpsuite`** pour voir les tables de cette
+application — par défaut ces interfaces affichent `public`, qui restera
+vide.
+
 ### Créer la base Neon
 
 1. Créez un projet sur [neon.tech](https://neon.tech) (offre gratuite
