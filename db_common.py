@@ -63,6 +63,7 @@ les tables de cette application.
 
 import os
 import sqlite3
+import datetime
 
 DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
 TURSO_URL = os.environ.get("TURSO_DATABASE_URL")
@@ -111,6 +112,20 @@ class _Row:
 
     def __repr__(self):
         return repr(dict(zip(self._index.keys(), self._values)))
+
+
+def _coerce_value(v):
+    """Postgres (psycopg2) renvoie de vrais objets datetime.datetime /
+    datetime.date pour les colonnes TIMESTAMP, alors que SQLite les stocke
+    (et les renvoie) comme du simple texte "YYYY-MM-DD HH:MM:SS". Or tout le
+    code applicatif (templates inclus, ex: `e.joined_at.split(' ')[0]`)
+    suppose des chaînes de caractères. On uniformise donc ici, une bonne
+    fois pour toutes, plutôt que de corriger chaque template un par un."""
+    if isinstance(v, datetime.datetime):
+        return v.strftime('%Y-%m-%d %H:%M:%S')
+    if isinstance(v, datetime.date):
+        return v.strftime('%Y-%m-%d')
+    return v
 
 
 def _translate_sql(sql):
@@ -162,11 +177,11 @@ class _PGCursor:
         raw = self._cur.fetchone()
         if raw is None:
             return None
-        return _Row(tuple(raw), self._row_index())
+        return _Row(tuple(_coerce_value(v) for v in raw), self._row_index())
 
     def fetchall(self):
         index = self._row_index()
-        return [_Row(tuple(r), index) for r in self._cur.fetchall()]
+        return [_Row(tuple(_coerce_value(v) for v in r), index) for r in self._cur.fetchall()]
 
     @property
     def lastrowid(self):
