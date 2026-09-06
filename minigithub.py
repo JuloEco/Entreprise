@@ -797,6 +797,9 @@ REPO_VIEW_TEMPLATE = BASE_HEADER + """
             <a href="{{ url_for('manage_collaborators', owner=repo.owner_name, repo_name=repo.name) }}" class="bg-ghDark border border-ghBorder text-white px-3 py-1.5 rounded-lg hover:bg-ghBorder transition flex items-center gap-1.5 font-medium">
                 <i data-lucide="users" class="w-4 h-4 text-ghBlue"></i> Accès & Rôles
             </a>
+            <a href="{{ url_for('repo_settings', owner=repo.owner_name, repo_name=repo.name) }}" class="bg-ghDark border border-ghBorder text-white px-3 py-1.5 rounded-lg hover:bg-ghBorder transition flex items-center gap-1.5 font-medium">
+                <i data-lucide="settings" class="w-4 h-4 text-ghMuted"></i> Paramètres
+            </a>
             {% endif %}
         </div>
     </div>
@@ -1093,6 +1096,36 @@ COLLABORATORS_TEMPLATE = BASE_HEADER + """
         <p class="text-sm text-ghMuted text-center py-4">Aucun collaborateur spécifique ajouté.</p>
         {% endfor %}
     </div>
+</div>
+""" + BASE_FOOTER
+
+REPO_SETTINGS_TEMPLATE = BASE_HEADER + """
+<div class="max-w-2xl mx-auto space-y-6">
+    <div class="bg-ghCard border border-ghBorder rounded-xl p-6">
+        <h1 class="text-xl font-bold text-white mb-4 flex items-center gap-2">
+            <i data-lucide="settings" class="w-6 h-6 text-ghBlue"></i> Paramètres — {{ repo.name }}
+        </h1>
+        <form method="POST" class="flex flex-col sm:flex-row gap-2">
+            <input type="hidden" name="action" value="rename">
+            <input type="text" name="new_name" value="{{ repo.name }}" required class="flex-1 bg-ghDark border border-ghBorder rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-ghBlue">
+            <button type="submit" class="bg-ghBlue text-white text-sm px-4 py-2 rounded-lg hover:bg-blue-600 transition">Renommer</button>
+        </form>
+        <p class="text-xs text-ghMuted mt-2">Les liens et signets existants pointant vers l'ancien nom cesseront de fonctionner.</p>
+    </div>
+
+    <div class="bg-red-950/20 border border-red-900/50 rounded-xl p-6">
+        <h2 class="text-sm font-bold text-red-400 mb-2 flex items-center gap-2">
+            <i data-lucide="alert-triangle" class="w-4 h-4"></i> Zone dangereuse
+        </h2>
+        <p class="text-xs text-ghMuted mb-4">La suppression d'un dépôt efface définitivement son code, ses branches et ses pull requests. Cette action est irréversible.</p>
+        <form method="POST" onsubmit="return confirm('Cette action est irréversible. Confirmer la suppression de {{ repo.name }} ?');" class="flex flex-col sm:flex-row gap-2">
+            <input type="hidden" name="action" value="delete">
+            <input type="text" name="confirm_name" required placeholder="Tapez « {{ repo.name }} » pour confirmer" class="flex-1 bg-ghDark border border-red-900/50 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-red-500">
+            <button type="submit" class="bg-red-600 hover:bg-red-500 text-white text-sm px-4 py-2 rounded-lg transition whitespace-nowrap">Supprimer le dépôt</button>
+        </form>
+    </div>
+
+    <a href="{{ url_for('view_repo', owner=repo.owner_name, repo_name=repo.name) }}" class="text-xs text-ghMuted hover:text-white inline-flex items-center gap-1"><i data-lucide="arrow-left" class="w-3.5 h-3.5"></i> Retour au dépôt</a>
 </div>
 """ + BASE_FOOTER
 
@@ -1872,6 +1905,60 @@ def remove_collaborator(owner, repo_name, user_id):
     db.commit()
     flash('Collaborateur retiré.', 'success')
     return redirect(url_for('manage_collaborators', owner=owner, repo_name=repo_name))
+
+@app.route('/<owner>/<repo_name>/settings', methods=['GET', 'POST'])
+def repo_settings(owner, repo_name):
+    repo, role = get_repo_and_role(owner, repo_name)
+    if not repo or role != 'ADMIN':
+        flash('Réservé à l administrateur du dépôt.', 'error')
+        return redirect(url_for('dashboard'))
+
+    db = get_db()
+    cursor = db.cursor()
+
+    if request.method == 'POST':
+        action = request.form.get('action')
+
+        if action == 'rename':
+            new_name = request.form.get('new_name', '').strip().lower().replace(' ', '-')
+            if not new_name:
+                flash('Le nouveau nom ne peut pas être vide.', 'error')
+            elif new_name == repo['name']:
+                flash('Le dépôt porte déjà ce nom.', 'error')
+            else:
+                cursor.execute("SELECT 1 FROM repositories WHERE owner_id = ? AND name = ? AND id != ?",
+                               (repo['owner_id'], new_name, repo['id']))
+                if cursor.fetchone():
+                    flash('Vous avez déjà un dépôt portant ce nom.', 'error')
+                else:
+                    cursor.execute("UPDATE repositories SET name = ? WHERE id = ?", (new_name, repo['id']))
+                    db.commit()
+                    flash(f'Dépôt renommé en « {new_name} ».', 'success')
+                    return redirect(url_for('repo_settings', owner=owner, repo_name=new_name))
+
+        elif action == 'delete':
+            if request.form.get('confirm_name', '').strip() != repo['name']:
+                flash('Le nom saisi ne correspond pas : suppression annulée.', 'error')
+            else:
+                cursor.execute("DELETE FROM files WHERE repo_id = ?", (repo['id'],))
+                cursor.execute("DELETE FROM branches WHERE repo_id = ?", (repo['id'],))
+                cursor.execute("DELETE FROM pull_requests WHERE repo_id = ?", (repo['id'],))
+                cursor.execute("DELETE FROM repository_collaborators WHERE repo_id = ?", (repo['id'],))
+                cursor.execute("DELETE FROM chat_messages WHERE chat_type = 'REPO' AND target_id = ?", (repo['id'],))
+                # Si ce dépôt a été créé depuis un projet CorpSuite, on retire
+                # aussi le lien (la table `projects` appartient à entreprise.py
+                # mais partage la même base — absente seulement si Mini GitHub
+                # tourne seul, en dev, sans CorpSuite : on l'ignore alors).
+                try:
+                    cursor.execute("DELETE FROM projects WHERE repo_id = ?", (repo['id'],))
+                except Exception:
+                    pass
+                cursor.execute("DELETE FROM repositories WHERE id = ?", (repo['id'],))
+                db.commit()
+                flash(f'Dépôt « {repo["name"]} » supprimé définitivement.', 'success')
+                return redirect(url_for('dashboard'))
+
+    return render_template_string(REPO_SETTINGS_TEMPLATE, repo=repo, role=role)
 
 @app.route('/<owner>/<repo_name>/pulls', methods=['GET', 'POST'])
 def repo_pull_requests(owner, repo_name):
