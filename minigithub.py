@@ -230,9 +230,9 @@ BASE_HEADER = """
 </head>
 <body class="bg-ghDark text-ghText font-sans min-h-screen flex flex-col">
     <header class="bg-ghCard border-b border-ghBorder sticky top-0 z-50">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-            <div class="flex items-center gap-6">
-                <a href="{{ url_for('dashboard') }}" class="flex items-center gap-2.5 text-white font-bold text-lg hover:opacity-90">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-2">
+            <div class="flex items-center gap-6 min-w-0">
+                <a href="{{ url_for('dashboard') }}" class="flex items-center gap-2.5 text-white font-bold text-lg hover:opacity-90 shrink-0">
                     <i data-lucide="github" class="w-8 h-8 text-ghBlue"></i>
                     <span>MiniGitHub <span class="bg-ghBlue/20 text-ghBlue text-xs px-2 py-0.5 rounded-full border border-ghBlue/30">Pro</span></span>
                 </a>
@@ -252,22 +252,42 @@ BASE_HEADER = """
             </div>
 
             {% if session.get('user_id') %}
-            <div class="flex items-center gap-4">
+            <div class="flex items-center gap-2 sm:gap-4">
                 <div class="flex items-center gap-2 text-xs">
-                    <div class="w-7 h-7 rounded-full flex items-center justify-center font-bold text-white text-xs uppercase" style="background-color: {{ session.get('avatar_color', '#3b82f6') }}">
+                    <div class="w-7 h-7 rounded-full flex items-center justify-center font-bold text-white text-xs uppercase shrink-0" style="background-color: {{ session.get('avatar_color', '#3b82f6') }}">
                         {{ session.get('username')[0] }}
                     </div>
                     <span class="font-medium text-white hidden sm:inline">{{ session.get('username') }}</span>
                 </div>
-                <a href="{{ url_for('logout') }}" class="text-ghMuted hover:text-red-400 p-2 rounded-lg hover:bg-ghBorder/40 transition" title="Déconnexion">
+                <a href="{{ url_for('logout') }}" class="text-ghMuted hover:text-red-400 p-2 rounded-lg hover:bg-ghBorder/40 transition hidden sm:inline-flex" title="Déconnexion">
                     <i data-lucide="log-out" class="w-4 h-4"></i>
                 </a>
+                <button id="mobileMenuBtn" onclick="document.getElementById('mobileMenu').classList.toggle('hidden'); document.getElementById('menuIconOpen').classList.toggle('hidden'); document.getElementById('menuIconClose').classList.toggle('hidden');" class="md:hidden p-2 rounded-lg hover:bg-ghBorder/40 text-ghText" aria-label="Ouvrir le menu">
+                    <i data-lucide="menu" id="menuIconOpen" class="w-5 h-5"></i>
+                    <i data-lucide="x" id="menuIconClose" class="w-5 h-5 hidden"></i>
+                </button>
             </div>
             {% endif %}
         </div>
+        {% if session.get('user_id') %}
+        <div id="mobileMenu" class="hidden md:hidden border-t border-ghBorder bg-ghCard px-4 py-3 space-y-1">
+            <a href="{{ url_for('dashboard') }}" class="px-3 py-2.5 rounded-lg text-ghText hover:text-white hover:bg-ghBorder/50 transition flex items-center gap-2 text-sm font-medium">
+                <i data-lucide="layout-dashboard" class="w-4 h-4 text-ghMuted"></i> Dashboard
+            </a>
+            <a href="{{ url_for('branch_offices') }}" class="px-3 py-2.5 rounded-lg text-ghText hover:text-white hover:bg-ghBorder/50 transition flex items-center gap-2 text-sm font-medium">
+                <i data-lucide="building-2" class="w-4 h-4 text-ghMuted"></i> Succursales
+            </a>
+            <a href="{{ url_for('create_repo') }}" class="px-3 py-2.5 rounded-lg text-ghGreen hover:bg-ghGreen/10 transition flex items-center gap-2 font-semibold text-sm">
+                <i data-lucide="plus-circle" class="w-4 h-4"></i> Nouveau Dépôt
+            </a>
+            <a href="{{ url_for('logout') }}" class="px-3 py-2.5 rounded-lg hover:bg-ghBorder/50 transition flex items-center gap-2 text-sm font-medium text-red-400 border-t border-ghBorder mt-2 pt-3">
+                <i data-lucide="log-out" class="w-4 h-4"></i> Déconnexion
+            </a>
+        </div>
+        {% endif %}
     </header>
 
-    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-6">
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
                 <div class="mb-6 space-y-2">

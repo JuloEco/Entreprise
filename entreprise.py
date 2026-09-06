@@ -393,10 +393,10 @@ APP_HEADER = """
 </head>
 <body class="bg-csBg text-csText font-sans min-h-screen flex flex-col antialiased">
     <header class="bg-csCard/80 backdrop-blur border-b border-csBorder sticky top-0 z-40">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-            <div class="flex items-center gap-6">
-                <a href="{{ url_for('landing') }}" class="flex items-center gap-2.5 text-white font-extrabold text-lg">
-                    <span class="brand-gradient w-8 h-8 rounded-lg flex items-center justify-center shadow-lg shadow-indigo-500/20">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-2">
+            <div class="flex items-center gap-6 min-w-0">
+                <a href="{{ url_for('landing') }}" class="flex items-center gap-2.5 text-white font-extrabold text-lg shrink-0">
+                    <span class="brand-gradient w-8 h-8 rounded-lg flex items-center justify-center shadow-lg shadow-indigo-500/20 shrink-0">
                         <i data-lucide="building-2" class="w-4.5 h-4.5 text-white"></i>
                     </span>
                     <span>Corp<span class="text-csIndigo">Suite</span></span>
@@ -421,7 +421,7 @@ APP_HEADER = """
                 </div>
                 {% endif %}
             </div>
-            <div class="flex items-center gap-3">
+            <div class="flex items-center gap-2 sm:gap-3">
                 {% if session.get('user_id') %}
                     {% if my_companies and my_companies|length > 1 %}
                     <div class="relative group hidden sm:block">
@@ -438,22 +438,62 @@ APP_HEADER = """
                     </div>
                     {% endif %}
                     <div class="flex items-center gap-2 text-xs">
-                        <div class="w-7 h-7 rounded-full flex items-center justify-center font-bold text-white text-xs uppercase" style="background-color: {{ session.get('avatar_color', '#6366f1') }}">
+                        <div class="w-7 h-7 rounded-full flex items-center justify-center font-bold text-white text-xs uppercase shrink-0" style="background-color: {{ session.get('avatar_color', '#6366f1') }}">
                             {{ session.get('username')[0] }}
                         </div>
                         <span class="font-medium text-white hidden sm:inline">{{ session.get('username') }}</span>
                     </div>
-                    <a href="{{ url_for('logout') }}" class="text-csMuted hover:text-red-400 p-2 rounded-lg hover:bg-csBorder/40 transition" title="Déconnexion">
+                    <a href="{{ url_for('logout') }}" class="text-csMuted hover:text-red-400 p-2 rounded-lg hover:bg-csBorder/40 transition hidden sm:inline-flex" title="Déconnexion">
                         <i data-lucide="log-out" class="w-4 h-4"></i>
                     </a>
                 {% else %}
-                    <a href="{{ url_for('login') }}" class="text-sm font-semibold text-csText hover:text-white px-3 py-2">Connexion</a>
-                    <a href="{{ url_for('found_company') }}" class="bg-csIndigo hover:bg-csIndigoHover text-white text-sm font-semibold px-4 py-2 rounded-lg transition shadow-lg shadow-indigo-500/20">Fonder mon entreprise</a>
+                    <a href="{{ url_for('login') }}" class="text-sm font-semibold text-csText hover:text-white px-2 sm:px-3 py-2">Connexion</a>
+                    <a href="{{ url_for('found_company') }}" class="bg-csIndigo hover:bg-csIndigoHover text-white text-xs sm:text-sm font-semibold px-3 sm:px-4 py-2 rounded-lg transition shadow-lg shadow-indigo-500/20 whitespace-nowrap"><span class="sm:hidden">Fonder</span><span class="hidden sm:inline">Fonder mon entreprise</span></a>
+                {% endif %}
+                {% if company or session.get('user_id') %}
+                <button id="mobileMenuBtn" onclick="document.getElementById('mobileMenu').classList.toggle('hidden'); document.getElementById('menuIconOpen').classList.toggle('hidden'); document.getElementById('menuIconClose').classList.toggle('hidden');" class="md:hidden p-2 rounded-lg hover:bg-csBorder/40 text-csText" aria-label="Ouvrir le menu">
+                    <i data-lucide="menu" id="menuIconOpen" class="w-5 h-5"></i>
+                    <i data-lucide="x" id="menuIconClose" class="w-5 h-5 hidden"></i>
+                </button>
                 {% endif %}
             </div>
         </div>
+        <div id="mobileMenu" class="hidden md:hidden border-t border-csBorder bg-csCard px-4 py-3 space-y-1">
+            {% if company %}
+            <a href="{{ url_for('company_dashboard', company_id=company.id) }}" class="px-3 py-2.5 rounded-lg hover:text-white hover:bg-csBorder/50 transition flex items-center gap-2 text-sm font-medium">
+                <i data-lucide="layout-dashboard" class="w-4 h-4 text-csMuted"></i> Tableau de bord
+            </a>
+            <a href="{{ url_for('messagerie', company_id=company.id) }}" class="px-3 py-2.5 rounded-lg hover:text-white hover:bg-csBorder/50 transition flex items-center gap-2 text-sm font-medium">
+                <i data-lucide="message-square" class="w-4 h-4 text-csMuted"></i> Messagerie
+            </a>
+            <a href="{{ url_for('equipe', company_id=company.id) }}" class="px-3 py-2.5 rounded-lg hover:text-white hover:bg-csBorder/50 transition flex items-center gap-2 text-sm font-medium">
+                <i data-lucide="users" class="w-4 h-4 text-csMuted"></i> Équipe
+            </a>
+            <a href="{{ url_for('postes', company_id=company.id) }}" class="px-3 py-2.5 rounded-lg hover:text-white hover:bg-csBorder/50 transition flex items-center gap-2 text-sm font-medium">
+                <i data-lucide="briefcase" class="w-4 h-4 text-csMuted"></i> Postes
+            </a>
+            <a href="{{ url_for('projets', company_id=company.id) }}" class="px-3 py-2.5 rounded-lg hover:text-white hover:bg-csBorder/50 transition flex items-center gap-2 text-sm font-medium">
+                <i data-lucide="folder-git-2" class="w-4 h-4 text-csMuted"></i> Projets
+            </a>
+            {% endif %}
+            {% if session.get('user_id') and my_companies and my_companies|length > 1 %}
+            <div class="pt-2 mt-2 border-t border-csBorder">
+                <p class="px-3 text-[10px] uppercase font-semibold text-csMuted mb-1">Changer d'entreprise</p>
+                {% for c in my_companies %}
+                <a href="{{ url_for('company_dashboard', company_id=c.id) }}" class="px-3 py-2 rounded-lg hover:bg-csBorder/50 transition flex items-center gap-2 text-sm">
+                    <span>{{ c.logo }}</span> <span class="font-medium">{{ c.name }}</span>
+                </a>
+                {% endfor %}
+            </div>
+            {% endif %}
+            {% if session.get('user_id') %}
+            <a href="{{ url_for('logout') }}" class="px-3 py-2.5 rounded-lg hover:bg-csBorder/50 transition flex items-center gap-2 text-sm font-medium text-red-400 border-t border-csBorder mt-2 pt-3">
+                <i data-lucide="log-out" class="w-4 h-4"></i> Déconnexion
+            </a>
+            {% endif %}
+        </div>
     </header>
-    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8">
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
                 <div class="mb-6 space-y-2">
@@ -847,8 +887,8 @@ EQUIPE_TEMPLATE = APP_HEADER + """
 </div>
 {% endif %}
 
-<div class="__CARD__ overflow-hidden">
-    <table class="w-full text-sm">
+<div class="__CARD__ overflow-x-auto">
+    <table class="w-full text-sm min-w-[560px]">
         <thead class="bg-csCard2 text-csMuted text-xs uppercase">
             <tr><th class="text-left px-5 py-3">Employé</th><th class="text-left px-5 py-3">Poste</th><th class="text-left px-5 py-3">Depuis</th><th class="text-right px-5 py-3">Actions</th></tr>
         </thead>
@@ -973,7 +1013,7 @@ POSTE_PERMISSIONS_TEMPLATE = APP_HEADER + """
         <div class="mt-2 pt-4 border-t border-csBorder">
             <p class="text-xs font-semibold uppercase text-csMuted mb-1">Peut licencier les postes suivants</p>
             <p class="text-[11px] text-csMuted mb-3">Actif uniquement si la compétence « Licencier des employés » ci-dessus est cochée.</p>
-            <div class="grid grid-cols-2 gap-2">
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 {% for op in other_postes %}
                 <label class="flex items-center gap-2 bg-csCard2 border border-csBorder rounded-lg px-3 py-2 text-xs cursor-pointer {% if not can_edit %}opacity-60 pointer-events-none{% endif %}">
                     <input type="checkbox" name="fire_targets" value="{{ op.id }}" {% if op.id in current_fire_targets %}checked{% endif %} class="w-3.5 h-3.5 accent-orange-500">
