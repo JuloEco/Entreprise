@@ -46,6 +46,19 @@ petite API que `sqlite3.Connection` utilisée dans le reste du code :
 `.execute()`, `.cursor()`, `.commit()`, `.rollback()`, `.close()`, avec des
 lignes accessibles à la fois par nom (`row['col']`) et par index
 (`row[0]`), comme `sqlite3.Row`.
+
+Isolation Postgres (schéma dédié)
+----------------------------------
+Sous Postgres, toutes les tables de l'application vivent dans un schéma
+dédié `corpsuite` (et non le schéma `public` par défaut), créé et activé
+automatiquement à l'ouverture de chaque connexion. Objectif : éviter toute
+collision si votre base Neon est aussi utilisée par un autre projet — sans
+cela, un `CREATE TABLE IF NOT EXISTS users` peut "récupérer" par erreur une
+table `users` posée là par une autre application, avec un schéma
+incompatible, et tout casser au moment de créer les clés étrangères.
+Conséquence pratique : dans l'explorateur de tables de Neon (ou via `psql`),
+pensez à sélectionner le schéma `corpsuite` plutôt que `public` pour voir
+les tables de cette application.
 """
 
 import os
@@ -207,6 +220,19 @@ def _open_postgres():
 
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = True
+
+    # Isole toutes les tables de l'application dans leur propre schéma
+    # Postgres plutôt que le schéma "public". Neon (comme la plupart des
+    # offres Postgres gratuites) pousse à réutiliser une même base pour
+    # plusieurs projets ; sans cette isolation, un simple `CREATE TABLE IF
+    # NOT EXISTS users` peut "trouver" par erreur une table `users` posée
+    # là par une toute autre application (avec un schéma incompatible — par
+    # ex. un id en texte au lieu d'un entier), et tout casser au moment de
+    # créer les clés étrangères qui pointent vers elle.
+    with conn.cursor() as cur:
+        cur.execute("CREATE SCHEMA IF NOT EXISTS corpsuite")
+        cur.execute("SET search_path TO corpsuite, public")
+
     return _PGConnection(conn)
 
 
