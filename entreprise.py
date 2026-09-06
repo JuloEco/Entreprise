@@ -73,6 +73,8 @@ PERMISSIONS = {
     'delete_project':     {'label': 'Supprimer des projets',             'icon': 'trash-2'},
     'manage_messaging':   {'label': "Modérer la messagerie d'entreprise",'icon': 'message-square'},
     'edit_company':       {'label': "Modifier la fiche entreprise",      'icon': 'edit-3'},
+    'fire_employee':      {'label': 'Licencier des employés',            'icon': 'user-minus'},
+    'delete_company':     {'label': "Supprimer l'entreprise",            'icon': 'flame'},
 }
 
 def init_db():
@@ -120,11 +122,17 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
 
-        # Colonne ajoutée à `users` si elle vient de github.py et ne l'a pas encore
+        # Colonnes ajoutées après coup (bases existantes) : on tente l'ALTER
+        # TABLE et on ignore l'erreur si la colonne existe déjà. Le except
+        # générique (plutôt que sqlite3.OperationalError) et le rollback()
+        # sont nécessaires pour rester compatible avec Postgres, où une
+        # instruction en échec doit être suivie d'un rollback avant de
+        # pouvoir continuer sur la même connexion.
         try:
             cur.execute("ALTER TABLE users ADD COLUMN must_setup_account INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
+            db.commit()
+        except Exception:
+            db.rollback()
 
         # --- Tables propres à CorpSuite ---
         cur.execute('''CREATE TABLE IF NOT EXISTS companies (
@@ -135,10 +143,18 @@ def init_db():
             homepage_text TEXT,
             branch_office_id INTEGER NOT NULL,
             pdg_user_id INTEGER NOT NULL,
+            parent_company_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (branch_office_id) REFERENCES branch_offices (id),
-            FOREIGN KEY (pdg_user_id) REFERENCES users (id)
+            FOREIGN KEY (pdg_user_id) REFERENCES users (id),
+            FOREIGN KEY (parent_company_id) REFERENCES companies (id)
         )''')
+        # Idem pour les bases créées avant l'ajout du statut de filiation.
+        try:
+            cur.execute("ALTER TABLE companies ADD COLUMN parent_company_id INTEGER")
+            db.commit()
+        except Exception:
+            db.rollback()
         cur.execute('''CREATE TABLE IF NOT EXISTS postes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             company_id INTEGER NOT NULL,
@@ -153,6 +169,16 @@ def init_db():
             poste_id INTEGER NOT NULL,
             permission_key TEXT NOT NULL,
             FOREIGN KEY (poste_id) REFERENCES postes (id)
+        )''')
+        # Personnalisation de la compétence "licencier" : quels postes un
+        # poste donné a-t-il le droit de licencier ? (le PDG, lui, peut
+        # toujours tout licencier, sans passer par cette table).
+        cur.execute('''CREATE TABLE IF NOT EXISTS poste_fire_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            poste_id INTEGER NOT NULL,
+            target_poste_id INTEGER NOT NULL,
+            FOREIGN KEY (poste_id) REFERENCES postes (id),
+            FOREIGN KEY (target_poste_id) REFERENCES postes (id)
         )''')
         cur.execute('''CREATE TABLE IF NOT EXISTS employees (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -225,6 +251,56 @@ def has_perm(company_id, key):
         (m['poste_id'], key)
     ).fetchone()
     return bool(r)
+
+def can_fire(company_id, target_user_id):
+    """Est-ce que la personne connectée a le droit de licencier
+    `target_user_id` de `company_id` ?
+
+    Le PDG peut toujours licencier n'importe qui (sauf lui-même). Toute
+    autre personne doit disposer de la compétence 'fire_employee' ET son
+    poste doit avoir été explicitement autorisé (via poste_fire_targets) à
+    licencier le poste occupé par la cible. Le PDG, lui, ne peut jamais
+    être licencié par ce biais.
+    """
+    if not session.get('user_id') or target_user_id == session.get('user_id'):
+        return False
+    actor = get_membership(company_id)
+    if not actor:
+        return False
+    target = get_db().execute("""
+        SELECT p.id AS poste_id, p.is_pdg FROM employees e JOIN postes p ON e.poste_id = p.id
+        WHERE e.company_id = ? AND e.user_id = ?
+    """, (company_id, target_user_id)).fetchone()
+    if not target or target['is_pdg']:
+        return False
+    if actor['is_pdg']:
+        return True
+    if not has_perm(company_id, 'fire_employee'):
+        return False
+    allowed = get_db().execute(
+        "SELECT 1 FROM poste_fire_targets WHERE poste_id = ? AND target_poste_id = ?",
+        (actor['poste_id'], target['poste_id'])
+    ).fetchone()
+    return bool(allowed)
+
+def get_company_children(company_id):
+    return get_db().execute(
+        "SELECT * FROM companies WHERE parent_company_id = ? ORDER BY name", (company_id,)
+    ).fetchall()
+
+def is_descendant(candidate_id, ancestor_id):
+    """True si `candidate_id` est déjà une filiale (directe ou indirecte)
+    de `ancestor_id` — auquel cas désigner `candidate_id` comme société
+    mère de `ancestor_id` créerait une boucle de filiation."""
+    current = candidate_id
+    seen = set()
+    while current is not None and current not in seen:
+        seen.add(current)
+        row = get_db().execute("SELECT parent_company_id FROM companies WHERE id = ?", (current,)).fetchone()
+        current = row['parent_company_id'] if row else None
+        if current == ancestor_id:
+            return True
+    return False
 
 def get_my_companies():
     if not session.get('user_id'):
@@ -458,6 +534,20 @@ COMPANY_PUBLIC_TEMPLATE = APP_HEADER + """
             <div>
                 <h1 class="text-2xl font-bold text-white">{{ c.name }}</h1>
                 <p class="text-xs text-csMuted mt-1">{{ member_count }} membre(s) · {{ project_count }} projet(s) actif(s) · Fondée le {{ c.created_at.split(' ')[0] }}</p>
+                {% if parent %}
+                <p class="text-xs text-csMuted mt-1 flex items-center gap-1">
+                    <i data-lucide="corner-left-up" class="w-3 h-3"></i> Filiale de
+                    <a href="{{ url_for('company_public', company_id=parent.id) }}" class="text-csIndigo hover:underline font-medium">{{ parent.name }}</a>
+                </p>
+                {% endif %}
+                {% if children %}
+                <p class="text-xs text-csMuted mt-1 flex items-center gap-1 flex-wrap">
+                    <i data-lucide="corner-right-down" class="w-3 h-3"></i> Société mère de :
+                    {% for ch in children %}
+                    <a href="{{ url_for('company_public', company_id=ch.id) }}" class="text-csIndigo hover:underline font-medium">{{ ch.name }}</a>{% if not loop.last %},{% endif %}
+                    {% endfor %}
+                </p>
+                {% endif %}
             </div>
         </div>
         {% if c.description %}<p class="text-sm text-csText mt-6">{{ c.description }}</p>{% endif %}
@@ -783,8 +873,13 @@ EQUIPE_TEMPLATE = APP_HEADER + """
                 </td>
                 <td class="px-5 py-3 text-csMuted text-xs">{{ e.joined_at.split(' ')[0] }}</td>
                 <td class="px-5 py-3 text-right">
+                    {% if e.user_id in fireable %}
+                    <form method="POST" action="{{ url_for('fire_employee', company_id=company.id, user_id=e.user_id) }}" onsubmit="return confirm('Licencier {{ e.username }} ? Cette personne perdra immédiatement l\'accès à l\'entreprise.');" class="inline">
+                        <button class="text-csMuted hover:text-orange-400 p-1.5" title="Licencier"><i data-lucide="user-minus" class="w-4 h-4"></i></button>
+                    </form>
+                    {% endif %}
                     {% if perms.delete_account and not e.is_pdg and e.user_id != session.get('user_id') %}
-                    <form method="POST" action="{{ url_for('delete_account', company_id=company.id, user_id=e.user_id) }}" onsubmit="return confirm('Supprimer ce compte ?');">
+                    <form method="POST" action="{{ url_for('delete_account', company_id=company.id, user_id=e.user_id) }}" onsubmit="return confirm('Supprimer ce compte ?');" class="inline">
                         <button class="text-csMuted hover:text-red-400 p-1.5" title="Supprimer le compte"><i data-lucide="user-x" class="w-4 h-4"></i></button>
                     </form>
                     {% endif %}
@@ -874,6 +969,22 @@ POSTE_PERMISSIONS_TEMPLATE = APP_HEADER + """
             <span class="text-sm text-csText">{{ meta.label }}</span>
         </label>
         {% endfor %}
+
+        <div class="mt-2 pt-4 border-t border-csBorder">
+            <p class="text-xs font-semibold uppercase text-csMuted mb-1">Peut licencier les postes suivants</p>
+            <p class="text-[11px] text-csMuted mb-3">Actif uniquement si la compétence « Licencier des employés » ci-dessus est cochée.</p>
+            <div class="grid grid-cols-2 gap-2">
+                {% for op in other_postes %}
+                <label class="flex items-center gap-2 bg-csCard2 border border-csBorder rounded-lg px-3 py-2 text-xs cursor-pointer {% if not can_edit %}opacity-60 pointer-events-none{% endif %}">
+                    <input type="checkbox" name="fire_targets" value="{{ op.id }}" {% if op.id in current_fire_targets %}checked{% endif %} class="w-3.5 h-3.5 accent-orange-500">
+                    <span class="text-csText">{{ op.name }}</span>
+                </label>
+                {% else %}
+                <p class="text-xs text-csMuted col-span-2">Aucun autre poste dans cette entreprise pour le moment.</p>
+                {% endfor %}
+            </div>
+        </div>
+
         {% if can_edit %}
         <button type="submit" class="w-full bg-csIndigo hover:bg-csIndigoHover text-white font-semibold py-2.5 rounded-lg text-sm transition mt-4">Enregistrer les permissions</button>
         {% endif %}
@@ -937,29 +1048,74 @@ PROJETS_TEMPLATE = APP_HEADER + """
 """.replace("__CARD__", CARD) + APP_FOOTER
 
 PARAMETRES_TEMPLATE = APP_HEADER + """
-<div class="max-w-xl mx-auto __CARD__ p-8">
-    <h1 class="text-xl font-bold text-white mb-6 flex items-center gap-2"><i data-lucide="settings" class="w-5 h-5 text-csIndigo"></i> Paramètres de l'entreprise</h1>
-    <form method="POST" class="space-y-4">
-        <div class="grid grid-cols-3 gap-3">
+<div class="max-w-xl mx-auto space-y-6">
+    <div class="__CARD__ p-8">
+        <h1 class="text-xl font-bold text-white mb-6 flex items-center gap-2"><i data-lucide="settings" class="w-5 h-5 text-csIndigo"></i> Paramètres de l'entreprise</h1>
+        {% if can_edit %}
+        <form method="POST" class="space-y-4">
+            <div class="grid grid-cols-3 gap-3">
+                <div>
+                    <label class="block text-xs font-semibold uppercase text-csMuted mb-1">Logo</label>
+                    <input type="text" name="logo" maxlength="4" value="{{ company.logo }}" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-center text-lg">
+                </div>
+                <div class="col-span-2">
+                    <label class="block text-xs font-semibold uppercase text-csMuted mb-1">Nom</label>
+                    <input type="text" name="name" required value="{{ company.name }}" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm">
+                </div>
+            </div>
             <div>
-                <label class="block text-xs font-semibold uppercase text-csMuted mb-1">Logo</label>
-                <input type="text" name="logo" maxlength="4" value="{{ company.logo }}" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-center text-lg">
+                <label class="block text-xs font-semibold uppercase text-csMuted mb-1">Description</label>
+                <input type="text" name="description" value="{{ company.description or '' }}" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm">
             </div>
-            <div class="col-span-2">
-                <label class="block text-xs font-semibold uppercase text-csMuted mb-1">Nom</label>
-                <input type="text" name="name" required value="{{ company.name }}" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm">
+            <div>
+                <label class="block text-xs font-semibold uppercase text-csMuted mb-1">Page d'accueil</label>
+                <textarea name="homepage_text" rows="4" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm">{{ company.homepage_text or '' }}</textarea>
             </div>
-        </div>
-        <div>
-            <label class="block text-xs font-semibold uppercase text-csMuted mb-1">Description</label>
-            <input type="text" name="description" value="{{ company.description or '' }}" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm">
-        </div>
-        <div>
-            <label class="block text-xs font-semibold uppercase text-csMuted mb-1">Page d'accueil</label>
-            <textarea name="homepage_text" rows="4" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm">{{ company.homepage_text or '' }}</textarea>
-        </div>
-        <button type="submit" class="w-full bg-csIndigo hover:bg-csIndigoHover text-white font-semibold py-2.5 rounded-lg text-sm transition">Enregistrer</button>
-    </form>
+            <button type="submit" class="w-full bg-csIndigo hover:bg-csIndigoHover text-white font-semibold py-2.5 rounded-lg text-sm transition">Enregistrer</button>
+        </form>
+        {% else %}
+        <p class="text-sm text-csMuted">Vous n'avez pas la permission de modifier la fiche de cette entreprise.</p>
+        {% endif %}
+    </div>
+
+    <div class="__CARD__ p-8">
+        <h2 class="text-sm font-bold text-white mb-1 flex items-center gap-2"><i data-lucide="git-branch" class="w-4 h-4 text-csIndigo"></i> Statut de l'entreprise</h2>
+        <p class="text-[11px] text-csMuted mb-4">Filiale de qui ? Société mère de qui ?</p>
+
+        {% if parent %}
+        <p class="text-sm text-csText mb-3">Filiale de <a href="{{ url_for('company_public', company_id=parent.id) }}" class="text-csIndigo hover:underline font-semibold">{{ parent.name }}</a></p>
+        {% else %}
+        <p class="text-sm text-csMuted mb-3">Entreprise indépendante (aucune société mère).</p>
+        {% endif %}
+
+        {% if children %}
+        <p class="text-xs text-csMuted mb-4">Société mère de : {% for ch in children %}<a href="{{ url_for('company_public', company_id=ch.id) }}" class="text-csIndigo hover:underline">{{ ch.name }}</a>{% if not loop.last %}, {% endif %}{% endfor %}</p>
+        {% endif %}
+
+        {% if can_edit %}
+        <form method="POST" class="flex flex-col sm:flex-row gap-2">
+            <input type="hidden" name="form" value="hierarchy">
+            <select name="parent_company_id" class="flex-1 bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+                <option value="">— Indépendante (aucune société mère) —</option>
+                {% for oc in other_companies %}
+                <option value="{{ oc.id }}" {% if parent and oc.id == parent.id %}selected{% endif %}>{{ oc.name }}</option>
+                {% endfor %}
+            </select>
+            <button type="submit" class="bg-csIndigo hover:bg-csIndigoHover text-white font-semibold px-5 py-2.5 rounded-lg text-sm transition whitespace-nowrap">Mettre à jour</button>
+        </form>
+        {% endif %}
+    </div>
+
+    {% if can_delete %}
+    <div class="__CARD__ p-8 border-red-900/50">
+        <h2 class="text-sm font-bold text-red-400 mb-2 flex items-center gap-2"><i data-lucide="flame" class="w-4 h-4"></i> Zone dangereuse</h2>
+        <p class="text-xs text-csMuted mb-4">Supprimer l'entreprise efface définitivement ses postes, ses comptes employés, ses projets et les dépôts de code associés. Les éventuelles filiales redeviennent indépendantes. Cette action est irréversible.</p>
+        <form method="POST" action="{{ url_for('delete_company', company_id=company.id) }}" onsubmit="return confirm('Cette action est irréversible. Confirmer la suppression définitive de {{ company.name }} ?');" class="flex flex-col sm:flex-row gap-2">
+            <input type="text" name="confirm_name" required placeholder="Tapez « {{ company.name }} » pour confirmer" class="flex-1 bg-csCard2 border border-red-900/50 rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-red-500">
+            <button type="submit" class="bg-red-600 hover:bg-red-500 text-white font-semibold px-5 py-2.5 rounded-lg text-sm transition whitespace-nowrap">Supprimer l'entreprise</button>
+        </form>
+    </div>
+    {% endif %}
 </div>
 """.replace("__CARD__", CARD) + APP_FOOTER
 
@@ -989,8 +1145,11 @@ def company_public(company_id):
     member_count = db.execute("SELECT COUNT(*) c FROM employees WHERE company_id=?", (company_id,)).fetchone()['c']
     project_count = db.execute("SELECT COUNT(*) c FROM projects WHERE company_id=?", (company_id,)).fetchone()['c']
     postes = db.execute("SELECT * FROM postes WHERE company_id=? ORDER BY is_pdg DESC, name", (company_id,)).fetchall()
+    parent = get_company(c['parent_company_id']) if c['parent_company_id'] else None
+    children = get_company_children(company_id)
     return render_template_string(COMPANY_PUBLIC_TEMPLATE, c=c, member_count=member_count,
-                                   project_count=project_count, postes=postes, my_companies=get_my_companies())
+                                   project_count=project_count, postes=postes, parent=parent, children=children,
+                                   my_companies=get_my_companies())
 
 # ---------------------------------------------------------------------------
 # Routes — Authentification
@@ -1189,8 +1348,9 @@ def equipe(company_id):
     postes = db.execute("SELECT * FROM postes WHERE company_id=? AND is_pdg=0 ORDER BY name", (company_id,)).fetchall()
     all_postes = db.execute("SELECT * FROM postes WHERE company_id=? ORDER BY name", (company_id,)).fetchall()
     perms = {k: has_perm(company_id, k) for k in PERMISSIONS}
+    fireable = {e['user_id'] for e in employees if can_fire(company_id, e['user_id'])}
     return render_template_string(EQUIPE_TEMPLATE, company=company, employees=employees, postes=all_postes,
-                                   perms=perms, my_companies=get_my_companies())
+                                   perms=perms, fireable=fireable, my_companies=get_my_companies())
 
 @app.route('/app/<int:company_id>/comptes/nouveau', methods=['POST'])
 @permission_required('create_account')
@@ -1251,6 +1411,26 @@ def delete_account(company_id, user_id):
         flash('Compte retiré de l\'entreprise.', 'success')
     return redirect(url_for('equipe', company_id=company_id))
 
+@app.route('/app/<int:company_id>/equipe/<int:user_id>/licencier', methods=['POST'])
+@member_required
+def fire_employee(company_id, user_id):
+    if not can_fire(company_id, user_id):
+        flash("Vous n'avez pas la compétence pour licencier cette personne.", 'error')
+        return redirect(url_for('equipe', company_id=company_id))
+
+    db = get_db()
+    target = db.execute("SELECT username FROM users WHERE id=?", (user_id,)).fetchone()
+    db.execute("DELETE FROM employees WHERE company_id=? AND user_id=?", (company_id, user_id))
+    if target:
+        db.execute(
+            "INSERT INTO company_messages (company_id, user_id, content) VALUES (?, ?, ?)",
+            (company_id, session['user_id'],
+             f"{target['username']} a été licencié(e) par {session['username']}.")
+        )
+    db.commit()
+    flash(f"{target['username'] if target else 'La personne'} a été licencié(e).", 'success')
+    return redirect(url_for('equipe', company_id=company_id))
+
 # ---------------------------------------------------------------------------
 # Routes — Postes & permissions
 # ---------------------------------------------------------------------------
@@ -1300,14 +1480,38 @@ def poste_permissions(company_id, poste_id):
             for key in selected:
                 if key in PERMISSIONS:
                     db.execute("INSERT INTO poste_permissions (poste_id, permission_key) VALUES (?, ?)", (poste_id, key))
+
+            # Personnalisation "qui peut licencier qui" : seulement pertinent
+            # si la compétence 'fire_employee' est cochée pour ce poste.
+            db.execute("DELETE FROM poste_fire_targets WHERE poste_id=?", (poste_id,))
+            if 'fire_employee' in selected:
+                for raw_tid in request.form.getlist('fire_targets'):
+                    if raw_tid.isdigit() and int(raw_tid) != poste_id:
+                        target_ok = db.execute(
+                            "SELECT 1 FROM postes WHERE id=? AND company_id=? AND is_pdg=0",
+                            (int(raw_tid), company_id)
+                        ).fetchone()
+                        if target_ok:
+                            db.execute(
+                                "INSERT INTO poste_fire_targets (poste_id, target_poste_id) VALUES (?, ?)",
+                                (poste_id, int(raw_tid))
+                            )
+
             db.commit()
             flash('Permissions mises à jour.', 'success')
         return redirect(url_for('poste_permissions', company_id=company_id, poste_id=poste_id))
 
     current_perms = {r['permission_key'] for r in db.execute(
         "SELECT permission_key FROM poste_permissions WHERE poste_id=?", (poste_id,)).fetchall()}
+    current_fire_targets = {r['target_poste_id'] for r in db.execute(
+        "SELECT target_poste_id FROM poste_fire_targets WHERE poste_id=?", (poste_id,)).fetchall()}
+    other_postes = db.execute(
+        "SELECT * FROM postes WHERE company_id=? AND is_pdg=0 AND id != ? ORDER BY name",
+        (company_id, poste_id)
+    ).fetchall()
     return render_template_string(POSTE_PERMISSIONS_TEMPLATE, company=company, poste=poste,
                                    permissions=PERMISSIONS, current_perms=current_perms, can_edit=can_edit,
+                                   other_postes=other_postes, current_fire_targets=current_fire_targets,
                                    my_companies=get_my_companies())
 
 # ---------------------------------------------------------------------------
@@ -1374,6 +1578,8 @@ def delete_project(company_id, project_id):
     if proj:
         db.execute("DELETE FROM files WHERE repo_id=?", (proj['repo_id'],))
         db.execute("DELETE FROM branches WHERE repo_id=?", (proj['repo_id'],))
+        db.execute("DELETE FROM pull_requests WHERE repo_id=?", (proj['repo_id'],))
+        db.execute("DELETE FROM repository_collaborators WHERE repo_id=?", (proj['repo_id'],))
         db.execute("DELETE FROM projects WHERE id=?", (project_id,))
         db.execute("DELETE FROM repositories WHERE id=?", (proj['repo_id'],))
         db.commit()
@@ -1385,11 +1591,37 @@ def delete_project(company_id, project_id):
 # ---------------------------------------------------------------------------
 
 @app.route('/app/<int:company_id>/parametres', methods=['GET', 'POST'])
-@permission_required('edit_company')
+@member_required
 def parametres(company_id):
     db = get_db()
     company = get_company(company_id)
+    can_edit = has_perm(company_id, 'edit_company')
+    can_delete = has_perm(company_id, 'delete_company')
+
     if request.method == 'POST':
+        if not can_edit:
+            flash('Permission refusée.', 'error')
+            return redirect(url_for('parametres', company_id=company_id))
+
+        if request.form.get('form') == 'hierarchy':
+            raw_parent = request.form.get('parent_company_id', '').strip()
+            if not raw_parent:
+                db.execute("UPDATE companies SET parent_company_id = NULL WHERE id=?", (company_id,))
+                db.commit()
+                flash("L'entreprise est désormais indépendante.", 'success')
+            else:
+                new_parent_id = int(raw_parent)
+                parent = get_company(new_parent_id)
+                if not parent:
+                    flash('Société mère introuvable.', 'error')
+                elif new_parent_id == company_id or is_descendant(new_parent_id, company_id):
+                    flash("Impossible : cela créerait une boucle de filiation (une filiale ne peut pas être sa propre société mère).", 'error')
+                else:
+                    db.execute("UPDATE companies SET parent_company_id = ? WHERE id=?", (new_parent_id, company_id))
+                    db.commit()
+                    flash(f"« {company['name']} » est désormais une filiale de « {parent['name']} ».", 'success')
+            return redirect(url_for('parametres', company_id=company_id))
+
         db.execute("UPDATE companies SET name=?, description=?, logo=?, homepage_text=? WHERE id=?",
                    (request.form['name'].strip(), request.form.get('description', '').strip(),
                     request.form.get('logo', '🏢').strip() or '🏢',
@@ -1397,7 +1629,57 @@ def parametres(company_id):
         db.commit()
         flash('Fiche entreprise mise à jour.', 'success')
         return redirect(url_for('company_dashboard', company_id=company_id))
-    return render_template_string(PARAMETRES_TEMPLATE, company=company, my_companies=get_my_companies())
+
+    other_companies = db.execute("SELECT * FROM companies WHERE id != ? ORDER BY name", (company_id,)).fetchall()
+    parent = get_company(company['parent_company_id']) if company['parent_company_id'] else None
+    children = get_company_children(company_id)
+    return render_template_string(PARAMETRES_TEMPLATE, company=company, my_companies=get_my_companies(),
+                                   can_edit=can_edit, can_delete=can_delete,
+                                   other_companies=other_companies, parent=parent, children=children)
+
+@app.route('/app/<int:company_id>/supprimer', methods=['POST'])
+@permission_required('delete_company')
+def delete_company(company_id):
+    db = get_db()
+    company = get_company(company_id)
+    if not company:
+        flash('Entreprise introuvable.', 'error')
+        return redirect(url_for('my_companies'))
+
+    if request.form.get('confirm_name', '').strip() != company['name']:
+        flash('Le nom saisi ne correspond pas : suppression annulée.', 'error')
+        return redirect(url_for('parametres', company_id=company_id))
+
+    # Les filiales éventuelles redeviennent des entreprises indépendantes
+    # plutôt que d'être supprimées en cascade.
+    db.execute("UPDATE companies SET parent_company_id = NULL WHERE parent_company_id = ?", (company_id,))
+
+    # Projets (et dépôts Mini GitHub associés)
+    for proj in db.execute("SELECT repo_id FROM projects WHERE company_id=?", (company_id,)).fetchall():
+        db.execute("DELETE FROM files WHERE repo_id=?", (proj['repo_id'],))
+        db.execute("DELETE FROM branches WHERE repo_id=?", (proj['repo_id'],))
+        db.execute("DELETE FROM pull_requests WHERE repo_id=?", (proj['repo_id'],))
+        db.execute("DELETE FROM repository_collaborators WHERE repo_id=?", (proj['repo_id'],))
+        db.execute("DELETE FROM repositories WHERE id=?", (proj['repo_id'],))
+    db.execute("DELETE FROM projects WHERE company_id=?", (company_id,))
+
+    # Comptes employés (doit précéder la suppression des postes, référencés
+    # par employees.poste_id)
+    db.execute("DELETE FROM employees WHERE company_id=?", (company_id,))
+
+    # Postes, permissions, cibles de licenciement
+    postes_ids = [r['id'] for r in db.execute("SELECT id FROM postes WHERE company_id=?", (company_id,)).fetchall()]
+    for pid in postes_ids:
+        db.execute("DELETE FROM poste_permissions WHERE poste_id=?", (pid,))
+        db.execute("DELETE FROM poste_fire_targets WHERE poste_id=? OR target_poste_id=?", (pid, pid))
+    db.execute("DELETE FROM postes WHERE company_id=?", (company_id,))
+
+    db.execute("DELETE FROM company_messages WHERE company_id=?", (company_id,))
+    db.execute("DELETE FROM companies WHERE id=?", (company_id,))
+    db.commit()
+
+    flash(f"L'entreprise « {company['name']} » a été définitivement supprimée.", 'success')
+    return redirect(url_for('my_companies'))
 
 # ---------------------------------------------------------------------------
 
