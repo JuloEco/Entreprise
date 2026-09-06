@@ -1,70 +1,117 @@
 # CorpSuite + Mini GitHub — déploiement Vercel
 
-## Ce qui a changé par rapport à vos deux fichiers d'origine
+## 1. Base de données : Postgres (Neon) recommandé
 
-Vos deux apps Flask ne pouvaient pas tourner telles quelles sur Vercel, pour
-deux raisons structurelles (pas des détails de configuration) :
+`db_common.py` choisit automatiquement son backend, dans cet ordre :
 
-1. **Deux serveurs sur deux ports** — Vercel exécute du code Python comme
-   des fonctions serverless à la demande, pas comme deux process qui
-   tournent en continu sur `:5000` et `:5001`. Il n'y a pas de "port" à
-   ouvrir.
-2. **SQLite en fichier local** — `minigithub.db` vivait sur le disque local.
-   Sur Vercel, le disque est en lecture seule (sauf `/tmp`, qui est effacé
-   entre les invocations). Un fichier SQLite classique ne peut donc plus
-   servir de source de vérité partagée.
+1. **Postgres** (recommandé — ex : [Neon](https://neon.tech)) si `DATABASE_URL`
+   (ou `POSTGRES_URL`) est défini. Vraie base persistante, partagée par
+   toutes les invocations serverless de Vercel.
+2. **Turso** (conservé pour compatibilité) si `TURSO_DATABASE_URL` est
+   défini et qu'aucune base Postgres n'est configurée.
+3. **SQLite local** en dernier recours, pour le développement sur votre
+   machine uniquement. **Ne jamais utiliser ce mode en production sur
+   Vercel** : `/tmp` n'est pas persistant entre les invocations.
 
-Les fichiers fournis ici règlent les deux problèmes en touchant le moins
-possible à la logique métier :
+Le reste du code (`entreprise.py`, `minigithub.py`) est resté écrit en SQL
+"façon SQLite" (placeholders `?`, `INTEGER PRIMARY KEY AUTOINCREMENT`,
+`INSERT OR REPLACE`) : `db_common.py` traduit ces requêtes à la volée vers
+la syntaxe Postgres quand c'est ce backend qui est actif. Vous n'avez donc
+rien à changer dans la logique métier existante.
 
-| Fichier | Rôle |
-|---|---|
-| `entreprise.py` | Votre `app.py` (CorpSuite), renommé pour ne pas entrer en conflit avec le point d'entrée Vercel, avec `secret_key`, `MINIGITHUB_URL` et la connexion DB rendus configurables. |
-| `minigithub.py` | Votre `github.py`, même traitement. |
-| `db_common.py` | Nouveau. Fournit la connexion DB : Turso (base SQLite hébergée) en prod, simple fichier SQLite en local — sans toucher au reste du code SQL. |
-| `app.py` | Nouveau. Point d'entrée Vercel : combine les deux apps Flask en une seule, sous un même domaine (`/` pour CorpSuite, `/github` pour Mini GitHub), pour que la session de connexion reste partagée. |
-| `scripts/init_remote_db.py` | À lancer une fois en local pour créer les tables sur la base distante. |
-| `vercel.json`, `.python-version`, `requirements.txt` | Config de déploiement. |
+### Créer la base Neon
 
-Le reste — toutes vos routes, templates, permissions, PR, diffs — est
-**inchangé**.
+1. Créez un projet sur [neon.tech](https://neon.tech) (offre gratuite
+   suffisante pour démarrer).
+2. Copiez la chaîne de connexion fournie dans le tableau de bord Neon
+   (elle ressemble à
+   `postgresql://user:password@ep-xxx.neon.tech/dbname?sslmode=require`).
+3. Ajoutez-la comme variable d'environnement `DATABASE_URL` dans les
+   réglages du projet Vercel (Settings → Environment Variables).
 
-## Étapes de déploiement
+### Créer les tables
 
-### 1. Créer la base Turso
-
-```bash
-npm install -g turso   # ou voir https://docs.turso.tech/cli/installation
-turso auth login
-turso db create corpsuite
-turso db show --url corpsuite
-turso db tokens create corpsuite
-```
-
-Notez l'URL et le token.
-
-### 2. Créer les tables sur la base distante (une seule fois)
+`app.py` appelle déjà `init_db()` pour les deux applications à chaque
+démarrage (cold start) : **les tables se créent automatiquement au premier
+déploiement**, aucune étape manuelle n'est requise. Le script
+`scripts/init_remote_db.py` reste disponible si vous préférez créer les
+tables avant même le premier déploiement, ou forcer leur mise à jour après
+un changement de schéma :
 
 ```bash
-export TURSO_DATABASE_URL="libsql://....turso.io"
-export TURSO_AUTH_TOKEN="...."
-cd vercel_migration
+export DATABASE_URL="postgresql://user:password@ep-xxx.neon.tech/dbname?sslmode=require"
 pip install -r requirements.txt
 python scripts/init_remote_db.py
 ```
 
-Relancez ce script à chaque évolution du schéma (nouvelles tables/colonnes).
+## 2. Nouvelles fonctionnalités CorpSuite
 
-### 3. Configurer les variables d'environnement sur Vercel
+### Licenciement d'employés
+
+- N'importe quel PDG peut licencier n'importe quel employé de son
+  entreprise (sauf lui-même), depuis la page **Équipe**.
+- Toute autre personne a besoin de la compétence **« Licencier des
+  employés »**, accordée à son poste depuis **Postes → (un poste) →
+  Permissions**.
+
+### Personnalisation : qui peut licencier qui ?
+
+Sur la page de gestion d'un poste (**Postes → (un poste)**), une fois la
+compétence « Licencier des employés » cochée, une seconde section permet de
+choisir **quels autres postes** ce poste a le droit de licencier. Par
+exemple : le poste « Manager » peut être autorisé à licencier « Stagiaire »
+mais pas « Développeur senior ». Le PDG n'est jamais concerné par cette
+matrice : il peut toujours tout faire, et ne peut jamais être licencié par
+ce biais.
+
+### Suppression d'entreprise
+
+Sur la page **Paramètres** d'une entreprise, dans la zone dangereuse, il
+est possible de supprimer définitivement l'entreprise (protégé par la
+permission **« Supprimer l'entreprise »**, comme toute autre permission —
+le PDG l'a toujours). La suppression :
+
+- efface les postes, permissions, comptes employés, projets et dépôts de
+  code associés ;
+- détache proprement les éventuelles filiales, qui redeviennent des
+  entreprises indépendantes plutôt que d'être supprimées en cascade ;
+- exige de retaper le nom exact de l'entreprise, pour éviter les
+  suppressions accidentelles.
+
+### Statuts d'entreprise (filiale / société mère)
+
+Toujours sur la page **Paramètres**, une entreprise peut désormais être
+déclarée filiale d'une autre entreprise de la plateforme (menu déroulant).
+La fiche publique et le tableau de bord affichent alors la société mère et
+la liste des filiales. Une protection empêche de créer une boucle de
+filiation (ex : une filiale ne peut pas devenir la société mère de sa
+propre société mère). Il s'agit d'une déclaration simple, sans processus
+d'acceptation croisée entre les deux entreprises.
+
+## 3. Nouvelles fonctionnalités Mini GitHub
+
+### Renommer / supprimer un dépôt
+
+Depuis la page d'un dépôt, un nouveau bouton **« Paramètres »** (visible par
+l'administrateur du dépôt) permet :
+
+- de **renommer** le dépôt (les anciens liens cessent de fonctionner) ;
+- de le **supprimer définitivement** (code, branches, pull requests,
+  collaborateurs), après avoir retapé son nom pour confirmer. Si le dépôt
+  provient d'un projet CorpSuite, le lien projet ↔ dépôt est également
+  retiré.
+
+## 4. Étapes de déploiement
+
+### a. Configurer les variables d'environnement sur Vercel
 
 Dans les réglages du projet Vercel (Settings → Environment Variables) :
 
 - `SHARED_SECRET_KEY` — une valeur aléatoire (`python -c "import secrets; print(secrets.token_hex(32))"`)
-- `TURSO_DATABASE_URL`
-- `TURSO_AUTH_TOKEN`
+- `DATABASE_URL` — votre chaîne de connexion Neon (recommandé)
 - `GEMINI_API_KEY` (optionnel, pour les résumés IA des pull requests)
 
-### 4. Déployer
+### b. Déployer
 
 ```bash
 vercel deploy
@@ -73,12 +120,12 @@ vercel deploy
 Vercel détecte automatiquement `app.py` à la racine comme point d'entrée
 Python (via `requirements.txt`).
 
-## Développement local
+## 5. Développement local
 
 Rien ne change : vous pouvez toujours lancer séparément
 `python entreprise.py` (port 5001) et `python minigithub.py` (port 5000)
-sans définir `TURSO_DATABASE_URL` — `db_common.py` retombe alors sur un
-fichier `minigithub.db` local, exactement comme avant.
+sans définir `DATABASE_URL` ni `TURSO_DATABASE_URL` — `db_common.py`
+retombe alors sur un fichier `minigithub.db` local, exactement comme avant.
 
 Pour tester la version combinée (celle réellement utilisée sur Vercel) :
 
@@ -86,18 +133,17 @@ Pour tester la version combinée (celle réellement utilisée sur Vercel) :
 python app.py     # http://127.0.0.1:3000  (/  et /github)
 ```
 
-## Points à vérifier vous-même avant mise en prod
+## 6. Points à vérifier vous-même avant mise en prod
 
-- **API `libsql`** : annoncée compatible `sqlite3` (row_factory, curseurs,
-  `lastrowid`) par Turso, mais je n'ai pas pu la tester contre une vraie
-  base Turso depuis cet environnement (pas d'accès réseau à Turso ici).
-  Faites un test complet création de compte → création d'entreprise →
-  création de projet après le premier déploiement.
-- **Données de démo** : dans le `github.py` que vous m'avez fourni, la
-  fonction `seed_data()` calcule `pw = hash_password('password123')` mais
-  ne contient plus les `INSERT` des comptes alice/bob/charlie (section
-  vide dans le fichier reçu) — à compléter si vous en avez besoin, ce
-  n'est pas lié à la migration Vercel.
+- **Neon en veille** : sur l'offre gratuite, une base Neon inactive se met
+  en pause et prend quelques centaines de ms à se "réveiller" à la première
+  requête après une période d'inactivité — normal, pas un bug.
+- **Filiation d'entreprise** : la déclaration filiale/société mère est
+  unilatérale (pas de confirmation demandée à l'autre entreprise). À adapter
+  si vous avez besoin d'un vrai processus d'acceptation.
 - **Limite de durée** : le plan gratuit Vercel limite l'exécution à 10s
   (60s en Pro). Le `maxDuration: 30` dans `vercel.json` suppose un plan
   payant ; réduisez à 10 si vous êtes sur le plan gratuit.
+- **Turso** : si vous migrez depuis un déploiement Turso existant vers
+  Postgres, pensez à exporter vos données avant de basculer `DATABASE_URL`
+  — les deux backends ne partagent pas les mêmes données.
