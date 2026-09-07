@@ -1299,12 +1299,12 @@ PROJETS_TEMPLATE = APP_HEADER + """
 {% if perms.create_project %}
 <div class="__CARD__ p-6 mb-6">
     <h3 class="font-bold text-white text-sm mb-4">Lancer un nouveau projet</h3>
-    <form method="POST" class="space-y-3">
+    <form method="POST" class="space-y-3"> 
         <div class="grid grid-cols-1 sm:grid-cols-[80px_1fr] gap-3">
             <input type="text" name="image" maxlength="4" value="{{ prefill and '💡' or '🚀' }}" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-center text-lg focus:outline-none focus:border-csIndigo">
             <input type="text" name="title" value="{{ prefill }}" required placeholder="Nom du projet (ex: Jeu de survie sur une île)" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
         </div>
-        <textarea name="description" rows="2" placeholder="De quoi s'agit-il ?">{{ prefill_desc }}</textarea>
+        <textarea name="description" rows="2" placeholder="De quoi s'agit-il ?" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">{{ prefill_desc }}</textarea>
         <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <select name="category" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
                 {% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
