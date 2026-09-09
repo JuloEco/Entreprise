@@ -1624,7 +1624,7 @@ PROJETS_TEMPLATE = APP_HEADER + """
             <input type="text" name="image" maxlength="4" value="{{ prefill and '💡' or '🚀' }}" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-center text-lg focus:outline-none focus:border-csIndigo">
             <input type="text" name="title" value="{{ prefill }}" required placeholder="Nom du projet (ex: Jeu de survie sur une île)" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
         </div>
-        <textarea name="description" rows="2" placeholder="De quoi s'agit-il ?">{{ prefill_desc }}</textarea>
+        <textarea name="description" rows="2" placeholder="De quoi s'agit-il ?" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">{{ prefill_desc }}</textarea>
 
         <div>
             <p class="text-xs font-semibold text-white mb-2">Quel type de projet créez-vous ?</p>
