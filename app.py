@@ -20,6 +20,7 @@ développement au quotidien ; ce fichier n'est utilisé que par Vercel (et par
 `python app.py` si vous voulez tester la version combinée en local).
 """
 
+from flask import Flask
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
 
 import entreprise
@@ -64,5 +65,8 @@ app = application
 
 if __name__ == "__main__":
     # Pratique pour tester la version "combinée" en local avant de déployer.
-    from werkzeug.serving import run_simple
-    run_simple("127.0.0.1", 3000, application, use_reloader=True, use_debugger=True)
+    # On sert la même application WSGI (le dispatcher) via l'API de Flask
+    # (`Flask.run`) plutôt qu'en appelant directement `werkzeug.serving`.
+    runner = Flask(__name__)
+    runner.wsgi_app = application
+    runner.run(host="127.0.0.1", port=3000, use_reloader=True, debug=True)

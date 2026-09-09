@@ -25,11 +25,13 @@ import sqlite3
 import hashlib
 import secrets
 import string
+import base64
+import mimetypes
 from functools import wraps
 from datetime import datetime
 from flask import (
     Flask, render_template_string, request, redirect,
-    url_for, session, flash, g
+    url_for, session, flash, g, Response
 )
 
 import db_common
@@ -72,6 +74,7 @@ PERMISSIONS = {
     'create_project':     {'label': 'Créer des projets (dépôts de code)','icon': 'folder-plus'},
     'delete_project':     {'label': 'Supprimer des projets',             'icon': 'trash-2'},
     'manage_messaging':   {'label': "Modérer la messagerie d'espace",'icon': 'message-square'},
+    'manage_files':       {'label': "Gérer les fichiers de l'espace", 'icon': 'folder-cog'},
     'edit_company':       {'label': "Modifier la fiche de l'espace",      'icon': 'edit-3'},
     'fire_employee':      {'label': 'Licencier des employés',            'icon': 'user-minus'},
     'delete_company':     {'label': "Supprimer l'espace",            'icon': 'flame'},
@@ -306,6 +309,139 @@ def init_db():
             FOREIGN KEY (company_id) REFERENCES companies (id),
             FOREIGN KEY (actor_id) REFERENCES users (id)
         )''')
+
+        # --- Priorité 10 : messagerie privée (DM) & discussion de projet ---
+        # (le 3e niveau, la discussion d'espace, existe déjà : company_messages)
+        cur.execute('''CREATE TABLE IF NOT EXISTS private_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender_id INTEGER NOT NULL,
+            recipient_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (sender_id) REFERENCES users (id),
+            FOREIGN KEY (recipient_id) REFERENCES users (id)
+        )''')
+        cur.execute('''CREATE TABLE IF NOT EXISTS project_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            company_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES projects (id),
+            FOREIGN KEY (company_id) REFERENCES companies (id),
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )''')
+
+        # --- Priorité 11 : fichiers et documents ---
+        # Espace partagé au niveau de l'espace, éventuellement rattaché à un
+        # projet précis (project_id NULL = fichier "général" de l'espace).
+        # Le contenu est stocké encodé en base64 dans `data` : pas de disque
+        # persistant disponible en environnement serverless (Vercel), donc
+        # on suit le même principe que la colonne `files.content` de Mini
+        # GitHub, déjà stockée en base.
+        cur.execute('''CREATE TABLE IF NOT EXISTS company_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            project_id INTEGER,
+            uploader_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'autre',
+            mime_type TEXT,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            description TEXT,
+            data TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (company_id) REFERENCES companies (id),
+            FOREIGN KEY (project_id) REFERENCES projects (id),
+            FOREIGN KEY (uploader_id) REFERENCES users (id)
+        )''')
+        db.commit()
+
+        # --- Système de modules de projet (section 15 de la vision) ---
+        # Un projet n'est plus enfermé dans une seule catégorie : c'est un
+        # ensemble composable de capacités (modules). La présence d'une
+        # ligne (project_id, module_key) signifie que le module est activé.
+        cur.execute('''CREATE TABLE IF NOT EXISTS project_modules (
+            project_id INTEGER NOT NULL,
+            module_key TEXT NOT NULL,
+            PRIMARY KEY (project_id, module_key),
+            FOREIGN KEY (project_id) REFERENCES projects (id)
+        )''')
+        db.commit()
+
+        # --- Module "Jeu vidéo" : Maps (galerie de cartes/niveaux versionnée) ---
+        cur.execute('''CREATE TABLE IF NOT EXISTS game_maps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            version TEXT,
+            emoji TEXT DEFAULT '🗺️',
+            notes TEXT,
+            created_by INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES projects (id),
+            FOREIGN KEY (created_by) REFERENCES users (id)
+        )''')
+        # --- Module "Jeu vidéo" : Bugs (bug tracker par sévérité/statut) ---
+        cur.execute('''CREATE TABLE IF NOT EXISTS game_bugs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            company_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            severity TEXT DEFAULT 'mineur',
+            status TEXT DEFAULT 'ouvert',
+            created_by INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES projects (id),
+            FOREIGN KEY (company_id) REFERENCES companies (id),
+            FOREIGN KEY (created_by) REFERENCES users (id)
+        )''')
+        # --- Module "Recherche IA" : Expériences (paramètres/résultat/statut) ---
+        cur.execute('''CREATE TABLE IF NOT EXISTS research_experiments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            company_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            parameters TEXT,
+            result TEXT,
+            status TEXT DEFAULT 'en_cours',
+            notes TEXT,
+            created_by INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES projects (id),
+            FOREIGN KEY (company_id) REFERENCES companies (id),
+            FOREIGN KEY (created_by) REFERENCES users (id)
+        )''')
+        # --- Module "Recherche IA" : Journal de recherche (entrées datées) ---
+        cur.execute('''CREATE TABLE IF NOT EXISTS research_journal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            company_id INTEGER NOT NULL,
+            hypothesis TEXT,
+            experiment TEXT,
+            result TEXT,
+            conclusion TEXT,
+            next_step TEXT,
+            created_by INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES projects (id),
+            FOREIGN KEY (company_id) REFERENCES companies (id),
+            FOREIGN KEY (created_by) REFERENCES users (id)
+        )''')
+        db.commit()
+
+        # Rétrocompatibilité : les projets créés avant l'introduction des
+        # modules gardent toutes leurs capacités actuelles activées (elles
+        # étaient déjà toutes visibles auparavant, sans notion de module).
+        existing_ids = [r['id'] for r in cur.execute("SELECT id FROM projects").fetchall()]
+        configured_ids = {r['project_id'] for r in cur.execute(
+            "SELECT DISTINCT project_id FROM project_modules").fetchall()}
+        for pid in existing_ids:
+            if pid not in configured_ids:
+                for key in PROJECT_MODULES:
+                    cur.execute("INSERT INTO project_modules (project_id, module_key) VALUES (?, ?)", (pid, key))
         db.commit()
 
 SPACE_TYPES = {
@@ -324,7 +460,59 @@ def log_activity(company_id, actor_id, activity_type, text):
                (company_id, actor_id, activity_type, text))
     db.commit()
 
-PROJECT_CATEGORIES = ['Code', 'Jeu', 'Art', 'École', 'IA', 'Musique', 'Écriture', 'Entrepreneuriat', 'Autre']
+PROJECT_MODULES = {
+    'taches':     {'label': 'Tâches',     'icon': 'list-checks',    'desc': "Kanban simple pour organiser le travail à faire"},
+    'discussion': {'label': 'Discussion', 'icon': 'message-square', 'desc': "Fil de discussion propre à ce projet"},
+    'fichiers':   {'label': 'Fichiers',   'icon': 'folder-open',    'desc': "Documents, images, audio, vidéo, archives..."},
+    'code':       {'label': 'Code',       'icon': 'code-2',         'desc': "Dépôt Mini GitHub associé au projet"},
+    'maps':       {'label': 'Maps',       'icon': 'map',            'desc': "Galerie des cartes/niveaux du jeu, avec versions"},
+    'bugs':       {'label': 'Bugs',       'icon': 'bug',            'desc': "Suivi des bugs façon bug tracker, par sévérité"},
+    'experiences':{'label': 'Expériences','icon': 'flask-conical',  'desc': "Journal d'expériences IA : paramètres, résultat, statut"},
+    'journal':    {'label': 'Journal',    'icon': 'notebook-pen',   'desc': "Journal de recherche daté : hypothèse, résultat, conclusion"},
+}
+
+# --- Types de projet proposés à la création ---
+# Chaque type illustre, dans son sous-titre, l'éventail de capacités visé
+# par la vision (certaines — Bugs, Galerie, Morceaux, Chapitres,
+# Expériences... — ne sont pas encore des modules réels et arriveront
+# progressivement). Le champ "modules" ne pré-coche que les modules
+# effectivement implémentés aujourd'hui (Tâches, Discussion, Fichiers,
+# Code) ; le reste du sous-titre est indicatif tant que ces modules
+# spécialisés ne sont pas construits.
+PROJECT_TYPES = {
+    'Développement': {'icon': '💻', 'subtitle': "Code · Issues · Pull Requests (déjà présent avec Mini GitHub)",
+                       'modules': ['code', 'taches', 'discussion', 'fichiers']},
+    'Jeu vidéo':      {'icon': '🎮', 'subtitle': "Tâches · Bugs · Assets · Maps · Code",
+                       'modules': ['code', 'taches', 'bugs', 'maps', 'discussion', 'fichiers']},
+    'Création':       {'icon': '🎨', 'subtitle': "Galerie · Versions · Fichiers · Commentaires",
+                       'modules': ['fichiers', 'discussion', 'taches']},
+    'Musique':        {'icon': '🎵', 'subtitle': "Morceaux · Audio · Paroles · Fichiers",
+                       'modules': ['fichiers', 'discussion', 'taches']},
+    'Écriture':       {'icon': '✍️', 'subtitle': "Chapitres · Personnages · Univers · Notes",
+                       'modules': ['fichiers', 'discussion', 'taches']},
+    'École':          {'icon': '🏫', 'subtitle': "Tâches · Documents · Sources · Calendrier",
+                       'modules': ['taches', 'fichiers', 'discussion']},
+    'Recherche IA':   {'icon': '🤖', 'subtitle': "Expériences · Résultats · Dataset · Notes · Code",
+                       'modules': ['code', 'experiences', 'journal', 'taches', 'discussion', 'fichiers']},
+    'Libre':          {'icon': '🧩', 'subtitle': "Choisis tes modules",
+                       'modules': []},
+}
+PROJECT_CATEGORIES = list(PROJECT_TYPES.keys())
+CATEGORY_MODULE_PRESETS = {label: info['modules'] for label, info in PROJECT_TYPES.items()}
+
+def get_project_modules(project_id):
+    """Renvoie l'ensemble des clés de modules activés pour un projet."""
+    rows = get_db().execute("SELECT module_key FROM project_modules WHERE project_id=?", (project_id,)).fetchall()
+    return {r['module_key'] for r in rows}
+
+def set_project_modules(project_id, module_keys):
+    """Remplace entièrement les modules activés d'un projet."""
+    db = get_db()
+    db.execute("DELETE FROM project_modules WHERE project_id=?", (project_id,))
+    for key in module_keys:
+        if key in PROJECT_MODULES:
+            db.execute("INSERT INTO project_modules (project_id, module_key) VALUES (?, ?)", (project_id, key))
+    db.commit()
 PROJECT_STATUSES = [
     ('idee', '💡 Idée'), ('planification', '📝 Planification'), ('construction', '🔨 Construction'),
     ('tests', '🧪 Tests'), ('publie', '🚀 Publié'),
@@ -333,6 +521,56 @@ TASK_STATUSES = [
     ('a_faire', '📋 À faire'), ('en_cours', '🔨 En cours'),
     ('a_tester', '🧪 À tester'), ('termine', '✅ Terminé'),
 ]
+
+# --- Module "Jeu vidéo" : Maps & Bugs (premier module réellement spécifique
+# à un domaine — les autres domaines pourront suivre le même schéma :
+# nouvelle table, entrée dans PROJECT_MODULES, routes /app/.../<module>) ---
+BUG_SEVERITIES = [
+    ('critique',  '🔴 Critique'), ('important', '🟠 Important'), ('mineur', '🟢 Mineur'),
+]
+BUG_STATUSES = [
+    ('ouvert', '📋 Ouvert'), ('en_cours', '🔨 En cours'), ('resolu', '✅ Résolu'),
+]
+
+# --- Module "Recherche IA" : Expériences & Journal (même schéma que Maps/Bugs
+# pour Jeu vidéo : nouvelle table, entrée dans PROJECT_MODULES, routes) ---
+EXPERIMENT_STATUSES = [
+    ('en_cours', '🟡 En cours'), ('succes', '🟢 Succès'), ('echec', '🔴 Échec'),
+]
+
+# --- Priorité 11 : catégories de fichiers ---
+MAX_FILE_SIZE = 3 * 1024 * 1024  # 3 Mo — stockage en base64 en base de données
+FILE_CATEGORIES = {
+    'document': {'label': 'Document', 'icon': '📄',
+                 'exts': {'pdf', 'doc', 'docx', 'odt', 'txt', 'md', 'rtf', 'xls', 'xlsx', 'csv', 'ppt', 'pptx'}},
+    'image':    {'label': 'Image', 'icon': '🖼️',
+                 'exts': {'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp'}},
+    'audio':    {'label': 'Audio', 'icon': '🎵',
+                 'exts': {'mp3', 'wav', 'ogg', 'flac', 'm4a'}},
+    'video':    {'label': 'Vidéo', 'icon': '🎥',
+                 'exts': {'mp4', 'mov', 'avi', 'mkv', 'webm'}},
+    'archive':  {'label': 'Archive', 'icon': '📦',
+                 'exts': {'zip', 'rar', '7z', 'tar', 'gz'}},
+    'code':     {'label': 'Code', 'icon': '💻',
+                 'exts': {'py', 'js', 'ts', 'jsx', 'tsx', 'html', 'css', 'json', 'java', 'c', 'cpp',
+                          'sql', 'sh', 'yml', 'yaml', 'rb', 'go', 'php'}},
+    'autre':    {'label': 'Autre', 'icon': '📁', 'exts': set()},
+}
+
+def detect_file_category(filename):
+    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+    for key, meta in FILE_CATEGORIES.items():
+        if ext in meta['exts']:
+            return key
+    return 'autre'
+
+def human_size(n):
+    n = n or 0
+    for unit in ('o', 'Ko', 'Mo', 'Go'):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == 'o' else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} To"
 
 # ---------------------------------------------------------------------------
 # Fonctions utilitaires
@@ -544,6 +782,9 @@ APP_HEADER = """
                     <a href="{{ url_for('idees', company_id=company.id) }}" class="px-3 py-2 rounded-lg hover:text-white hover:bg-csBorder/50 transition flex items-center gap-1.5">
                         <i data-lucide="lightbulb" class="w-4 h-4 text-csMuted"></i> Idées
                     </a>
+                    <a href="{{ url_for('fichiers', company_id=company.id) }}" class="px-3 py-2 rounded-lg hover:text-white hover:bg-csBorder/50 transition flex items-center gap-1.5">
+                        <i data-lucide="folder-open" class="w-4 h-4 text-csMuted"></i> Fichiers
+                    </a>
                     <a href="{{ url_for('activity_feed', company_id=company.id) }}" class="px-3 py-2 rounded-lg hover:text-white hover:bg-csBorder/50 transition flex items-center gap-1.5">
                         <i data-lucide="newspaper" class="w-4 h-4 text-csMuted"></i> Fil
                     </a>
@@ -552,6 +793,9 @@ APP_HEADER = """
             </div>
             <div class="flex items-center gap-2 sm:gap-3">
                 {% if session.get('user_id') %}
+                    <a href="{{ url_for('messages_list') }}" class="text-csMuted hover:text-white p-2 rounded-lg hover:bg-csBorder/40 transition hidden sm:inline-flex" title="Messages privés">
+                        <i data-lucide="mail" class="w-4 h-4"></i>
+                    </a>
                     {% if my_companies and my_companies|length > 1 %}
                     <div class="relative group hidden sm:block">
                         <button class="text-xs font-semibold px-3 py-2 rounded-lg border border-csBorder hover:bg-csBorder/40 flex items-center gap-1.5 text-csMuted">
@@ -609,6 +853,9 @@ APP_HEADER = """
             <a href="{{ url_for('idees', company_id=company.id) }}" class="px-3 py-2.5 rounded-lg hover:text-white hover:bg-csBorder/50 transition flex items-center gap-2 text-sm font-medium">
                 <i data-lucide="lightbulb" class="w-4 h-4 text-csMuted"></i> Idées
             </a>
+            <a href="{{ url_for('fichiers', company_id=company.id) }}" class="px-3 py-2.5 rounded-lg hover:text-white hover:bg-csBorder/50 transition flex items-center gap-2 text-sm font-medium">
+                <i data-lucide="folder-open" class="w-4 h-4 text-csMuted"></i> Fichiers
+            </a>
             <a href="{{ url_for('activity_feed', company_id=company.id) }}" class="px-3 py-2.5 rounded-lg hover:text-white hover:bg-csBorder/50 transition flex items-center gap-2 text-sm font-medium">
                 <i data-lucide="newspaper" class="w-4 h-4 text-csMuted"></i> Fil
             </a>
@@ -624,6 +871,9 @@ APP_HEADER = """
             </div>
             {% endif %}
             {% if session.get('user_id') %}
+            <a href="{{ url_for('messages_list') }}" class="px-3 py-2.5 rounded-lg hover:bg-csBorder/50 transition flex items-center gap-2 text-sm font-medium">
+                <i data-lucide="mail" class="w-4 h-4 text-csMuted"></i> Messages privés
+            </a>
             <a href="{{ url_for('profil', username=session.get('username')) }}" class="px-3 py-2.5 rounded-lg hover:bg-csBorder/50 transition flex items-center gap-2 text-sm font-medium">
                 <i data-lucide="user-round" class="w-4 h-4 text-csMuted"></i> Mon profil
             </a>
@@ -1014,6 +1264,74 @@ MESSAGERIE_TEMPLATE = APP_HEADER + """
 """.replace("__CARD__", CARD) + APP_FOOTER
 
 # ---------------------------------------------------------------------------
+# Priorité 10 — Messages privés (2e niveau de messagerie)
+# ---------------------------------------------------------------------------
+
+MESSAGES_LIST_TEMPLATE = APP_HEADER + """
+<h1 class="text-xl font-bold text-white mb-4 flex items-center gap-2"><i data-lucide="mail" class="w-5 h-5 text-csIndigo"></i> Messages privés</h1>
+
+<div class="__CARD__ p-5 mb-6">
+    <form method="POST" action="{{ url_for('start_conversation') }}" class="flex flex-col sm:flex-row gap-3">
+        <input type="text" name="username" required placeholder="Identifiant de la personne (ex: jules)" class="flex-1 bg-csCard2 border border-csBorder rounded-lg px-3.5 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+        <button type="submit" class="bg-csIndigo hover:bg-csIndigoHover text-white font-semibold px-5 py-2.5 rounded-lg text-sm transition whitespace-nowrap flex items-center gap-1.5"><i data-lucide="square-pen" class="w-4 h-4"></i> Nouveau message</button>
+    </form>
+</div>
+
+<div class="__CARD__ divide-y divide-csBorder">
+    {% for c in convos %}
+    <a href="{{ url_for('private_conversation', username=c.username) }}" class="flex items-center gap-3 p-4 hover:bg-csBorder/20 transition">
+        <div class="w-10 h-10 rounded-full flex items-center justify-center font-bold text-white text-sm uppercase shrink-0" style="background-color: {{ c.avatar_color }}">{{ c.username[0] }}</div>
+        <div class="flex-1 min-w-0">
+            <p class="font-semibold text-white text-sm">{{ c.display_name or c.username }}</p>
+            <p class="text-xs text-csMuted truncate">{{ c.last_content or '' }}</p>
+        </div>
+        {% if c.last_at %}<span class="text-[10px] text-csMuted shrink-0">{{ c.last_at.split(' ')[0] }}</span>{% endif %}
+    </a>
+    {% else %}
+    <div class="p-10 text-center text-csMuted">
+        <i data-lucide="mail" class="w-10 h-10 mx-auto mb-3 opacity-40"></i>
+        <p>Aucune conversation pour le moment. Écrivez à quelqu'un ci-dessus, ou depuis son profil.</p>
+    </div>
+    {% endfor %}
+</div>
+""".replace("__CARD__", CARD) + APP_FOOTER
+
+PRIVATE_CONVERSATION_TEMPLATE = APP_HEADER + """
+<div class="flex items-center justify-between mb-4">
+    <h1 class="text-xl font-bold text-white flex items-center gap-2">
+        <div class="w-7 h-7 rounded-full flex items-center justify-center font-bold text-white text-xs uppercase shrink-0" style="background-color: {{ other.avatar_color }}">{{ other.username[0] }}</div>
+        <a href="{{ url_for('profil', username=other.username) }}" class="hover:text-csIndigo transition">{{ other.display_name or other.username }}</a>
+    </h1>
+    <a href="{{ url_for('messages_list') }}" class="text-xs text-csIndigo hover:underline">← Toutes les conversations</a>
+</div>
+<div class="__CARD__ flex flex-col h-[65vh]">
+    <div class="flex-1 overflow-y-auto custom-scrollbar p-5 space-y-4">
+        {% for m in thread %}
+        <div class="flex items-start gap-3 {% if m.sender_id == session.get('user_id') %}flex-row-reverse{% endif %}">
+            <div class="w-8 h-8 rounded-full flex items-center justify-center font-bold text-white text-xs uppercase shrink-0" style="background-color: {{ m.sender_id == session.get('user_id') and session.get('avatar_color') or other.avatar_color }}">{{ m.username[0] }}</div>
+            <div class="max-w-[75%] {% if m.sender_id == session.get('user_id') %}text-right{% endif %}">
+                <div class="inline-block {% if m.sender_id == session.get('user_id') %}bg-csIndigo text-white{% else %}bg-csCard2 border border-csBorder text-csText{% endif %} rounded-2xl px-4 py-2 text-sm">{{ m.content }}</div>
+                <p class="text-[10px] text-csMuted mt-1">{{ m.created_at }}
+                    {% if m.sender_id == session.get('user_id') %}
+                    <form method="POST" action="{{ url_for('delete_private_message', username=other.username, message_id=m.id) }}" class="inline">
+                        <button class="text-csMuted hover:text-red-400 ml-1" title="Supprimer"><i data-lucide="trash-2" class="w-3 h-3 inline"></i></button>
+                    </form>
+                    {% endif %}
+                </p>
+            </div>
+        </div>
+        {% else %}
+        <p class="text-sm text-csMuted text-center mt-10">Aucun message. Dites bonjour !</p>
+        {% endfor %}
+    </div>
+    <form method="POST" class="border-t border-csBorder p-4 flex gap-3">
+        <input type="text" name="content" required autofocus placeholder="Écrire un message..." class="flex-1 bg-csCard2 border border-csBorder rounded-lg px-3.5 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+        <button type="submit" class="bg-csIndigo hover:bg-csIndigoHover text-white font-semibold px-4 py-2.5 rounded-lg text-sm transition flex items-center gap-1.5"><i data-lucide="send" class="w-4 h-4"></i></button>
+    </form>
+</div>
+""".replace("__CARD__", CARD) + APP_FOOTER
+
+# ---------------------------------------------------------------------------
 # Équipe & comptes
 # ---------------------------------------------------------------------------
 
@@ -1099,6 +1417,8 @@ PROFIL_TEMPLATE = APP_HEADER + """
             </div>
             {% if is_self %}
             <a href="{{ url_for('edit_profil') }}" class="text-xs font-semibold border border-csBorder hover:bg-csBorder/40 px-3 py-2 rounded-lg flex items-center gap-1.5 text-csMuted"><i data-lucide="pencil" class="w-3.5 h-3.5"></i> Modifier mon profil</a>
+            {% else %}
+            <a href="{{ url_for('private_conversation', username=profile_user.username) }}" class="text-xs font-semibold bg-csIndigo hover:bg-csIndigoHover text-white px-3 py-2 rounded-lg flex items-center gap-1.5"><i data-lucide="mail" class="w-3.5 h-3.5"></i> Envoyer un message</a>
             {% endif %}
         </div>
         <p class="text-sm text-csText mt-5">{{ profile_user.bio or "Cette personne n'a pas encore écrit de bio." }}</p>
@@ -1299,16 +1619,30 @@ PROJETS_TEMPLATE = APP_HEADER + """
 {% if perms.create_project %}
 <div class="__CARD__ p-6 mb-6">
     <h3 class="font-bold text-white text-sm mb-4">Lancer un nouveau projet</h3>
-    <form method="POST" class="space-y-3"> 
+    <form method="POST" class="space-y-3">
         <div class="grid grid-cols-1 sm:grid-cols-[80px_1fr] gap-3">
             <input type="text" name="image" maxlength="4" value="{{ prefill and '💡' or '🚀' }}" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-center text-lg focus:outline-none focus:border-csIndigo">
             <input type="text" name="title" value="{{ prefill }}" required placeholder="Nom du projet (ex: Jeu de survie sur une île)" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
         </div>
-        <textarea name="description" rows="2" placeholder="De quoi s'agit-il ?" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">{{ prefill_desc }}</textarea>
-        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <select name="category" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
-                {% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
-            </select>
+        <textarea name="description" rows="2" placeholder="De quoi s'agit-il ?">{{ prefill_desc }}</textarea>
+
+        <div>
+            <p class="text-xs font-semibold text-white mb-2">Quel type de projet créez-vous ?</p>
+            <input type="hidden" name="category" id="category-input" value="{{ project_types.keys()|list|first }}">
+            <div id="type-picker" class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {% for label, info in project_types.items() %}
+                <button type="button"
+                        class="type-card text-left bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 hover:border-csIndigo/60 transition{% if loop.first %} ring-2 ring-csIndigo border-csIndigo{% endif %}"
+                        data-category="{{ label }}" data-modules="{{ info.modules|join(',') }}">
+                    <div class="text-lg mb-1">{{ info.icon }}</div>
+                    <div class="text-xs font-semibold text-white">{{ label }}</div>
+                    <div class="text-[10px] text-csMuted mt-0.5 leading-snug">{{ info.subtitle }}</div>
+                </button>
+                {% endfor %}
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <select name="visibility" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
                 <option value="prive">🔒 Privé (membres de l'espace)</option>
                 <option value="invitation">✉️ Sur invitation</option>
@@ -1320,10 +1654,41 @@ PROJETS_TEMPLATE = APP_HEADER + """
         <label class="flex items-center gap-2 text-xs text-csMuted">
             <input type="checkbox" name="is_private" checked class="w-4 h-4 accent-indigo-500"> Dépôt de code privé
         </label>
+        <div class="border-t border-csBorder pt-3">
+            <p class="text-xs font-semibold text-white mb-2 flex items-center gap-1.5"><i data-lucide="puzzle" class="w-3.5 h-3.5 text-csIndigo"></i> Capacités activées <span class="text-csMuted font-normal">(pré-cochées selon le type choisi ci-dessus, modifiables)</span></p>
+            <div id="modules-picker" class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {% for key, m in modules.items() %}
+                <label class="flex items-center gap-2 text-xs bg-csCard2 border border-csBorder rounded-lg px-3 py-2 cursor-pointer hover:border-csIndigo/50 transition">
+                    <input type="checkbox" name="modules" value="{{ key }}" class="module-checkbox w-4 h-4 accent-indigo-500">
+                    <i data-lucide="{{ m.icon }}" class="w-3.5 h-3.5 text-csMuted"></i> {{ m.label }}
+                </label>
+                {% endfor %}
+            </div>
+            <p class="text-[10px] text-csMuted mt-2">Les autres capacités mentionnées ci-dessus (Bugs, Galerie, Morceaux, Chapitres, Expériences...) font partie de la feuille de route et arriveront progressivement comme nouveaux modules.</p>
+        </div>
         <button type="submit" class="bg-csIndigo hover:bg-csIndigoHover text-white font-semibold px-5 py-2.5 rounded-lg text-sm transition">Créer le projet</button>
     </form>
     <p class="text-[11px] text-csMuted mt-2 flex items-center gap-1.5"><i data-lucide="info" class="w-3 h-3"></i> Le code n'est qu'une fonctionnalité parmi d'autres : jeu, art, école, musique, IA... tout projet a sa place.</p>
 </div>
+<script>
+(function() {
+    var typeCards = document.querySelectorAll('.type-card');
+    var categoryInput = document.getElementById('category-input');
+    var checkboxes = document.querySelectorAll('#modules-picker .module-checkbox');
+    if (!typeCards.length || !categoryInput) return;
+    function selectType(card) {
+        typeCards.forEach(function(c) { c.classList.remove('ring-2', 'ring-csIndigo', 'border-csIndigo'); });
+        card.classList.add('ring-2', 'ring-csIndigo', 'border-csIndigo');
+        categoryInput.value = card.dataset.category;
+        var preset = card.dataset.modules ? card.dataset.modules.split(',').filter(Boolean) : [];
+        checkboxes.forEach(function(cb) { cb.checked = preset.indexOf(cb.value) !== -1; });
+    }
+    typeCards.forEach(function(card) {
+        card.addEventListener('click', function() { selectType(card); });
+    });
+    selectType(typeCards[0]);
+})();
+</script>
 {% endif %}
 
 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1341,11 +1706,34 @@ PROJETS_TEMPLATE = APP_HEADER + """
             <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-csCard2 border border-csBorder text-csMuted">{{ statuses.get(p.status, '💡 Idée') }}</span>
         </div>
         <p class="text-xs text-csMuted line-clamp-2 mb-4">{{ p.description or "Aucune description." }}</p>
-        <div class="flex items-center justify-between text-xs">
+        <div class="flex items-center justify-between text-xs flex-wrap gap-y-2">
             <span class="text-csMuted">Par {{ p.owner_name }} · {{ p.created_at.split(' ')[0] }}</span>
-            <div class="flex items-center gap-3">
+            <div class="flex items-center gap-3 flex-wrap">
+                {% if 'taches' in p.modules %}
                 <a href="{{ url_for('project_tasks', company_id=company.id, project_id=p.id) }}" class="text-csIndigo hover:underline flex items-center gap-1"><i data-lucide="list-checks" class="w-3.5 h-3.5"></i> Tâches</a>
+                {% endif %}
+                {% if 'discussion' in p.modules %}
+                <a href="{{ url_for('project_discussion', company_id=company.id, project_id=p.id) }}" class="text-csIndigo hover:underline flex items-center gap-1"><i data-lucide="message-square" class="w-3.5 h-3.5"></i> Discussion</a>
+                {% endif %}
+                {% if 'fichiers' in p.modules %}
+                <a href="{{ url_for('fichiers', company_id=company.id, projet=p.id) }}" class="text-csIndigo hover:underline flex items-center gap-1"><i data-lucide="folder-open" class="w-3.5 h-3.5"></i> Fichiers</a>
+                {% endif %}
+                {% if 'code' in p.modules %}
                 <a href="{{ minigithub_url }}/{{ p.owner_name }}/{{ p.repo_name }}" target="_blank" class="text-csIndigo hover:underline flex items-center gap-1">Code <i data-lucide="external-link" class="w-3 h-3"></i></a>
+                {% endif %}
+                {% if 'maps' in p.modules %}
+                <a href="{{ url_for('project_maps', company_id=company.id, project_id=p.id) }}" class="text-csIndigo hover:underline flex items-center gap-1"><i data-lucide="map" class="w-3.5 h-3.5"></i> Maps</a>
+                {% endif %}
+                {% if 'bugs' in p.modules %}
+                <a href="{{ url_for('project_bugs', company_id=company.id, project_id=p.id) }}" class="text-csIndigo hover:underline flex items-center gap-1"><i data-lucide="bug" class="w-3.5 h-3.5"></i> Bugs</a>
+                {% endif %}
+                {% if 'experiences' in p.modules %}
+                <a href="{{ url_for('project_experiments', company_id=company.id, project_id=p.id) }}" class="text-csIndigo hover:underline flex items-center gap-1"><i data-lucide="flask-conical" class="w-3.5 h-3.5"></i> Expériences</a>
+                {% endif %}
+                {% if 'journal' in p.modules %}
+                <a href="{{ url_for('project_journal', company_id=company.id, project_id=p.id) }}" class="text-csIndigo hover:underline flex items-center gap-1"><i data-lucide="notebook-pen" class="w-3.5 h-3.5"></i> Journal</a>
+                {% endif %}
+                <a href="{{ url_for('project_modules_settings', company_id=company.id, project_id=p.id) }}" class="text-csMuted hover:text-white flex items-center gap-1" title="Modules du projet"><i data-lucide="puzzle" class="w-3.5 h-3.5"></i></a>
                 {% if perms.delete_project %}
                 <form method="POST" action="{{ url_for('delete_project', company_id=company.id, project_id=p.id) }}" onsubmit="return confirm('Supprimer ce projet ?');">
                     <button class="text-csMuted hover:text-red-400"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
@@ -1357,6 +1745,33 @@ PROJETS_TEMPLATE = APP_HEADER + """
     {% else %}
     <div class="col-span-full __CARD__ p-10 text-center text-csMuted">Aucun projet pour le moment.</div>
     {% endfor %}
+</div>
+""".replace("__CARD__", CARD) + APP_FOOTER
+
+MODULES_TEMPLATE = APP_HEADER + """
+<div class="flex items-center justify-between mb-4">
+    <h1 class="text-xl font-bold text-white flex items-center gap-2"><i data-lucide="puzzle" class="w-5 h-5 text-csIndigo"></i> Modules — {{ project.title or project.repo_name }}</h1>
+    <a href="{{ url_for('projets', company_id=company.id) }}" class="text-xs text-csIndigo hover:underline">← Retour aux projets</a>
+</div>
+<div class="__CARD__ p-6">
+    <p class="text-xs text-csMuted mb-4">Un projet est un ensemble composable de capacités : activez ou désactivez ce dont ce projet a besoin. Rien n'est perdu en désactivant un module — les données restent en place si vous le réactivez.</p>
+    <form method="POST" class="space-y-3">
+        {% for key, m in modules.items() %}
+        <label class="flex items-center gap-3 bg-csCard2 border border-csBorder rounded-lg px-4 py-3 cursor-pointer hover:border-csIndigo/50 transition">
+            <input type="checkbox" name="modules" value="{{ key }}" {% if key in active_modules %}checked{% endif %} {% if not can_edit %}disabled{% endif %} class="w-4 h-4 accent-indigo-500">
+            <i data-lucide="{{ m.icon }}" class="w-4 h-4 text-csIndigo shrink-0"></i>
+            <div>
+                <p class="text-sm font-semibold text-white">{{ m.label }}</p>
+                <p class="text-[11px] text-csMuted">{{ m.desc }}</p>
+            </div>
+        </label>
+        {% endfor %}
+        {% if can_edit %}
+        <button type="submit" class="bg-csIndigo hover:bg-csIndigoHover text-white font-semibold px-5 py-2.5 rounded-lg text-sm transition">Enregistrer</button>
+        {% else %}
+        <p class="text-[11px] text-csMuted flex items-center gap-1.5"><i data-lucide="lock" class="w-3 h-3"></i> Seul·e le créateur du projet ou une personne habilitée à gérer les projets peut modifier ces réglages.</p>
+        {% endif %}
+    </form>
 </div>
 """.replace("__CARD__", CARD) + APP_FOOTER
 
@@ -1501,6 +1916,337 @@ TASKS_TEMPLATE = APP_HEADER + """
             <p class="text-[11px] text-csMuted">Rien ici.</p>
             {% endfor %}
         </div>
+    </div>
+    {% endfor %}
+</div>
+""".replace("__CARD__", CARD) + APP_FOOTER
+
+# ---------------------------------------------------------------------------
+# Module "Jeu vidéo" — Maps (galerie de cartes/niveaux versionnée)
+# ---------------------------------------------------------------------------
+
+MAPS_TEMPLATE = APP_HEADER + """
+<div class="flex items-center justify-between mb-6">
+    <h1 class="text-xl font-bold text-white flex items-center gap-2"><i data-lucide="map" class="w-5 h-5 text-csIndigo"></i> Maps — {{ project.title or project.repo_name }}</h1>
+    <a href="{{ url_for('projets', company_id=company.id) }}" class="text-xs text-csIndigo hover:underline">← Retour aux projets</a>
+</div>
+
+<div class="__CARD__ p-6 mb-6">
+    <h3 class="font-bold text-white text-sm mb-4">Nouvelle carte</h3>
+    <form method="POST" class="grid grid-cols-1 sm:grid-cols-[70px_1fr_120px] gap-3">
+        <input type="text" name="emoji" maxlength="4" value="🏝️" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-center text-lg focus:outline-none focus:border-csIndigo">
+        <input type="text" name="name" required placeholder="Ex: Île principale" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+        <input type="text" name="version" placeholder="Version (ex: v4)" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+        <textarea name="notes" rows="2" placeholder="Notes (optionnel)" class="sm:col-span-3 w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo"></textarea>
+        <button type="submit" class="sm:col-span-3 bg-csIndigo hover:bg-csIndigoHover text-white font-semibold px-5 py-2.5 rounded-lg text-sm transition">Ajouter la carte</button>
+    </form>
+</div>
+
+<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+    {% for m in maps %}
+    <div class="__CARD__ p-4 text-center">
+        <div class="text-4xl mb-2">{{ m.emoji or '🗺️' }}</div>
+        <p class="text-sm font-semibold text-white truncate">{{ m.name }}</p>
+        {% if m.version %}<p class="text-[11px] text-csMuted">{{ m.version }}</p>{% endif %}
+        {% if m.notes %}<p class="text-[11px] text-csMuted mt-1 line-clamp-2">{{ m.notes }}</p>{% endif %}
+        {% if m.created_by == session.get('user_id') or perms.delete_project %}
+        <form method="POST" action="{{ url_for('delete_map', company_id=company.id, project_id=project.id, map_id=m.id) }}" onsubmit="return confirm('Supprimer cette carte ?');" class="mt-2">
+            <button class="text-csMuted hover:text-red-400 text-[11px] flex items-center gap-1 mx-auto"><i data-lucide="trash-2" class="w-3 h-3"></i> Supprimer</button>
+        </form>
+        {% endif %}
+    </div>
+    {% else %}
+    <div class="__CARD__ p-10 text-center text-csMuted col-span-full">
+        <i data-lucide="map" class="w-10 h-10 mx-auto mb-3 opacity-40"></i>
+        <p>Aucune carte pour le moment.</p>
+    </div>
+    {% endfor %}
+</div>
+""".replace("__CARD__", CARD) + APP_FOOTER
+
+# ---------------------------------------------------------------------------
+# Module "Jeu vidéo" — Bugs (bug tracker par sévérité/statut)
+# ---------------------------------------------------------------------------
+
+BUGS_TEMPLATE = APP_HEADER + """
+<div class="flex items-center justify-between mb-6">
+    <h1 class="text-xl font-bold text-white flex items-center gap-2"><i data-lucide="bug" class="w-5 h-5 text-csIndigo"></i> Bugs — {{ project.title or project.repo_name }}</h1>
+    <a href="{{ url_for('projets', company_id=company.id) }}" class="text-xs text-csIndigo hover:underline">← Retour aux projets</a>
+</div>
+
+<div class="__CARD__ p-6 mb-6">
+    <h3 class="font-bold text-white text-sm mb-4">Signaler un bug</h3>
+    <form method="POST" class="space-y-3">
+        <div class="grid grid-cols-1 sm:grid-cols-[1fr_160px] gap-3">
+            <input type="text" name="title" required placeholder="Ex: Le joueur traverse le sol" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+            <select name="severity" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+                {% for sk, sl in severities %}
+                <option value="{{ sk }}" {% if sk == 'mineur' %}selected{% endif %}>{{ sl }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <textarea name="description" rows="2" placeholder="Détails, étapes pour reproduire... (optionnel)" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo"></textarea>
+        <button type="submit" class="bg-csIndigo hover:bg-csIndigoHover text-white font-semibold px-5 py-2.5 rounded-lg text-sm transition">Signaler</button>
+    </form>
+</div>
+
+<div class="space-y-6">
+    {% for sk, sl in severities %}
+    <div>
+        <h3 class="font-bold text-white text-xs uppercase tracking-wide mb-3">{{ sl }} <span class="text-csMuted font-normal">({{ bugs_by_severity.get(sk, [])|length }})</span></h3>
+        <div class="space-y-2">
+            {% for b in bugs_by_severity.get(sk, []) %}
+            <div class="__CARD__ p-4 flex items-start justify-between gap-3">
+                <div class="flex-1 min-w-0">
+                    <p class="text-sm font-medium text-white">{{ b.title }}</p>
+                    {% if b.description %}<p class="text-xs text-csMuted mt-1">{{ b.description }}</p>{% endif %}
+                    <p class="text-[10px] text-csMuted mt-1">{{ b.created_at.split(' ')[0] }}</p>
+                </div>
+                <div class="flex items-center gap-2 shrink-0">
+                    <form method="POST" action="{{ url_for('update_bug_status', company_id=company.id, project_id=project.id, bug_id=b.id) }}">
+                        <select name="status" onchange="this.form.submit()" class="bg-csCard2 border border-csBorder rounded px-1.5 py-1 text-[10px] text-csMuted focus:outline-none">
+                            {% for stk, stl in statuses %}
+                            <option value="{{ stk }}" {% if stk == b.status %}selected{% endif %}>{{ stl }}</option>
+                            {% endfor %}
+                        </select>
+                    </form>
+                    <form method="POST" action="{{ url_for('delete_bug', company_id=company.id, project_id=project.id, bug_id=b.id) }}" onsubmit="return confirm('Supprimer ce bug ?');">
+                        <button class="text-csMuted hover:text-red-400"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+                    </form>
+                </div>
+            </div>
+            {% else %}
+            <p class="text-[11px] text-csMuted">Aucun bug ici.</p>
+            {% endfor %}
+        </div>
+    </div>
+    {% endfor %}
+</div>
+""".replace("__CARD__", CARD) + APP_FOOTER
+
+# ---------------------------------------------------------------------------
+# Module "Recherche IA" — Expériences (paramètres/résultat/statut)
+# ---------------------------------------------------------------------------
+
+EXPERIMENTS_TEMPLATE = APP_HEADER + """
+<div class="flex items-center justify-between mb-6">
+    <h1 class="text-xl font-bold text-white flex items-center gap-2"><i data-lucide="flask-conical" class="w-5 h-5 text-csIndigo"></i> Expériences — {{ project.title or project.repo_name }}</h1>
+    <a href="{{ url_for('projets', company_id=company.id) }}" class="text-xs text-csIndigo hover:underline">← Retour aux projets</a>
+</div>
+
+<div class="__CARD__ p-6 mb-6">
+    <h3 class="font-bold text-white text-sm mb-4">Nouvelle expérience</h3>
+    <form method="POST" class="space-y-3">
+        <div class="grid grid-cols-1 sm:grid-cols-[1fr_160px] gap-3">
+            <input type="text" name="name" required placeholder="Ex: SmallLM-v4" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+            <select name="status" class="bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+                {% for sk, sl in statuses %}
+                <option value="{{ sk }}" {% if sk == 'en_cours' %}selected{% endif %}>{{ sl }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <input type="text" name="parameters" placeholder="Paramètres (ex: 350M · lr 3e-4 · batch 128 · 4 epochs)" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+        <input type="text" name="result" placeholder="Résultat (ex: loss 1.84 · perplexity 6.3)" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+        <textarea name="notes" rows="2" placeholder="Notes (optionnel)" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo"></textarea>
+        <button type="submit" class="bg-csIndigo hover:bg-csIndigoHover text-white font-semibold px-5 py-2.5 rounded-lg text-sm transition">Enregistrer</button>
+    </form>
+</div>
+
+<div class="__CARD__ divide-y divide-csBorder">
+    {% for e in experiments %}
+    <div class="flex items-center gap-3 p-4">
+        <div class="w-9 h-9 rounded-lg bg-csCard2 border border-csBorder flex items-center justify-center text-sm shrink-0">
+            {% if e.status == 'succes' %}🟢{% elif e.status == 'echec' %}🔴{% else %}🟡{% endif %}
+        </div>
+        <div class="flex-1 min-w-0">
+            <p class="text-sm font-semibold text-white truncate">{{ e.name }}</p>
+            <p class="text-[11px] text-csMuted truncate">{{ e.parameters or '' }}</p>
+            {% if e.result %}<p class="text-[11px] text-csIndigo truncate">{{ e.result }}</p>{% endif %}
+            {% if e.notes %}<p class="text-[11px] text-csMuted mt-0.5 line-clamp-2">{{ e.notes }}</p>{% endif %}
+            <p class="text-[10px] text-csMuted mt-0.5">{{ e.created_at.split(' ')[0] }}</p>
+        </div>
+        <div class="flex items-center gap-2 shrink-0">
+            <form method="POST" action="{{ url_for('update_experiment_status', company_id=company.id, project_id=project.id, exp_id=e.id) }}">
+                <select name="status" onchange="this.form.submit()" class="bg-csCard2 border border-csBorder rounded px-1.5 py-1 text-[10px] text-csMuted focus:outline-none">
+                    {% for sk, sl in statuses %}
+                    <option value="{{ sk }}" {% if sk == e.status %}selected{% endif %}>{{ sl }}</option>
+                    {% endfor %}
+                </select>
+            </form>
+            <form method="POST" action="{{ url_for('delete_experiment', company_id=company.id, project_id=project.id, exp_id=e.id) }}" onsubmit="return confirm('Supprimer cette expérience ?');">
+                <button class="text-csMuted hover:text-red-400"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+            </form>
+        </div>
+    </div>
+    {% else %}
+    <div class="p-10 text-center text-csMuted">
+        <i data-lucide="flask-conical" class="w-10 h-10 mx-auto mb-3 opacity-40"></i>
+        <p>Aucune expérience pour le moment.</p>
+    </div>
+    {% endfor %}
+</div>
+""".replace("__CARD__", CARD) + APP_FOOTER
+
+# ---------------------------------------------------------------------------
+# Module "Recherche IA" — Journal de recherche (entrées datées)
+# ---------------------------------------------------------------------------
+
+JOURNAL_TEMPLATE = APP_HEADER + """
+<div class="flex items-center justify-between mb-6">
+    <h1 class="text-xl font-bold text-white flex items-center gap-2"><i data-lucide="notebook-pen" class="w-5 h-5 text-csIndigo"></i> Journal de recherche — {{ project.title or project.repo_name }}</h1>
+    <a href="{{ url_for('projets', company_id=company.id) }}" class="text-xs text-csIndigo hover:underline">← Retour aux projets</a>
+</div>
+
+<div class="__CARD__ p-6 mb-6">
+    <h3 class="font-bold text-white text-sm mb-4">Nouvelle entrée</h3>
+    <form method="POST" class="space-y-3">
+        <div>
+            <label class="block text-[11px] font-semibold text-csMuted mb-1">Hypothèse</label>
+            <textarea name="hypothesis" rows="2" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo"></textarea>
+        </div>
+        <div>
+            <label class="block text-[11px] font-semibold text-csMuted mb-1">Expérience</label>
+            <textarea name="experiment" rows="2" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo"></textarea>
+        </div>
+        <div>
+            <label class="block text-[11px] font-semibold text-csMuted mb-1">Résultat</label>
+            <textarea name="result" rows="2" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo"></textarea>
+        </div>
+        <div>
+            <label class="block text-[11px] font-semibold text-csMuted mb-1">Conclusion</label>
+            <textarea name="conclusion" rows="2" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo"></textarea>
+        </div>
+        <div>
+            <label class="block text-[11px] font-semibold text-csMuted mb-1">Prochaine étape</label>
+            <textarea name="next_step" rows="2" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo"></textarea>
+        </div>
+        <button type="submit" class="bg-csIndigo hover:bg-csIndigoHover text-white font-semibold px-5 py-2.5 rounded-lg text-sm transition">Ajouter l'entrée</button>
+    </form>
+</div>
+
+<div class="space-y-4">
+    {% for e in entries %}
+    <div class="__CARD__ p-5">
+        <div class="flex items-center justify-between mb-2">
+            <span class="text-xs font-semibold text-csMuted">{{ e.created_at.split(' ')[0] }} · {{ e.username }}</span>
+            {% if e.created_by == session.get('user_id') or perms.delete_project %}
+            <form method="POST" action="{{ url_for('delete_journal_entry', company_id=company.id, project_id=project.id, entry_id=e.id) }}" onsubmit="return confirm('Supprimer cette entrée ?');">
+                <button class="text-csMuted hover:text-red-400"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+            </form>
+            {% endif %}
+        </div>
+        <div class="space-y-2 text-xs">
+            {% if e.hypothesis %}<p><span class="font-semibold text-white">Hypothèse :</span> <span class="text-csText">{{ e.hypothesis }}</span></p>{% endif %}
+            {% if e.experiment %}<p><span class="font-semibold text-white">Expérience :</span> <span class="text-csText">{{ e.experiment }}</span></p>{% endif %}
+            {% if e.result %}<p><span class="font-semibold text-white">Résultat :</span> <span class="text-csText">{{ e.result }}</span></p>{% endif %}
+            {% if e.conclusion %}<p><span class="font-semibold text-white">Conclusion :</span> <span class="text-csText">{{ e.conclusion }}</span></p>{% endif %}
+            {% if e.next_step %}<p><span class="font-semibold text-white">Prochaine étape :</span> <span class="text-csText">{{ e.next_step }}</span></p>{% endif %}
+        </div>
+    </div>
+    {% else %}
+    <div class="__CARD__ p-10 text-center text-csMuted">
+        <i data-lucide="notebook-pen" class="w-10 h-10 mx-auto mb-3 opacity-40"></i>
+        <p>Aucune entrée pour le moment.</p>
+    </div>
+    {% endfor %}
+</div>
+""".replace("__CARD__", CARD) + APP_FOOTER
+
+# ---------------------------------------------------------------------------
+# Priorité 10 — Discussion de projet (3e niveau de messagerie)
+# ---------------------------------------------------------------------------
+
+PROJECT_DISCUSSION_TEMPLATE = APP_HEADER + """
+<div class="flex items-center justify-between mb-4">
+    <h1 class="text-xl font-bold text-white flex items-center gap-2"><i data-lucide="message-square" class="w-5 h-5 text-csIndigo"></i> Discussion — {{ project.title or project.repo_name }}</h1>
+    <a href="{{ url_for('projets', company_id=company.id) }}" class="text-xs text-csIndigo hover:underline">← Retour aux projets</a>
+</div>
+<div class="__CARD__ flex flex-col h-[65vh]">
+    <div class="flex-1 overflow-y-auto custom-scrollbar p-5 space-y-4">
+        {% for m in messages %}
+        <div class="flex items-start gap-3">
+            <div class="w-8 h-8 rounded-full flex items-center justify-center font-bold text-white text-xs uppercase shrink-0" style="background-color: {{ m.avatar_color }}">{{ m.username[0] }}</div>
+            <div class="flex-1">
+                <div class="flex items-center gap-2">
+                    <span class="font-semibold text-white text-sm">{{ m.username }}</span>
+                    <span class="text-[10px] text-csMuted">{{ m.created_at }}</span>
+                </div>
+                <p class="text-sm text-csText mt-0.5">{{ m.content }}</p>
+            </div>
+            {% if m.user_id == session.get('user_id') or perms.manage_messaging %}
+            <form method="POST" action="{{ url_for('delete_project_message', company_id=company.id, project_id=project.id, message_id=m.id) }}">
+                <button class="text-csMuted hover:text-red-400 p-1" title="Supprimer"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+            </form>
+            {% endif %}
+        </div>
+        {% else %}
+        <p class="text-sm text-csMuted text-center mt-10">Aucun message. Lancez la discussion sur ce projet !</p>
+        {% endfor %}
+    </div>
+    <form method="POST" class="border-t border-csBorder p-4 flex gap-3">
+        <input type="text" name="content" required placeholder="Écrire un message sur ce projet..." class="flex-1 bg-csCard2 border border-csBorder rounded-lg px-3.5 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+        <button type="submit" class="bg-csIndigo hover:bg-csIndigoHover text-white font-semibold px-4 py-2.5 rounded-lg text-sm transition flex items-center gap-1.5"><i data-lucide="send" class="w-4 h-4"></i></button>
+    </form>
+</div>
+""".replace("__CARD__", CARD) + APP_FOOTER
+
+# ---------------------------------------------------------------------------
+# Priorité 11 — Fichiers et documents
+# ---------------------------------------------------------------------------
+
+FICHIERS_TEMPLATE = APP_HEADER + """
+<div class="flex items-center justify-between mb-6 flex-wrap gap-2">
+    <h1 class="text-xl font-bold text-white flex items-center gap-2">
+        <i data-lucide="folder-open" class="w-5 h-5 text-csIndigo"></i>
+        Fichiers — {{ company.name }}{% if project %} · {{ project.title or project.repo_name }}{% endif %}
+    </h1>
+    {% if project %}
+    <a href="{{ url_for('projets', company_id=company.id) }}" class="text-xs text-csIndigo hover:underline">← Retour aux projets</a>
+    {% else %}
+    <a href="{{ url_for('fichiers', company_id=company.id) }}" class="text-xs text-csMuted hover:text-white">Voir tous les fichiers de l'espace</a>
+    {% endif %}
+</div>
+
+<div class="__CARD__ p-6 mb-6">
+    <h3 class="font-bold text-white text-sm mb-4 flex items-center gap-2"><i data-lucide="upload" class="w-4 h-4 text-csIndigo"></i> Ajouter un fichier</h3>
+    <form method="POST" enctype="multipart/form-data" class="space-y-3">
+        <input type="file" name="file" required class="w-full text-sm text-csText file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-csIndigo file:text-white hover:file:bg-csIndigoHover file:cursor-pointer bg-csCard2 border border-csBorder rounded-lg">
+        <input type="text" name="description" placeholder="Description (optionnel)" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3.5 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+        {% if not project %}
+        <select name="project_id" class="w-full bg-csCard2 border border-csBorder rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-csIndigo">
+            <option value="">Fichier général de l'espace (pas lié à un projet)</option>
+            {% for p in projects_list %}<option value="{{ p.id }}">{{ p.image }} {{ p.title or p.repo_name }}</option>{% endfor %}
+        </select>
+        {% else %}
+        <input type="hidden" name="project_id" value="{{ project.id }}">
+        {% endif %}
+        <button type="submit" class="bg-csIndigo hover:bg-csIndigoHover text-white font-semibold px-5 py-2.5 rounded-lg text-sm transition">Envoyer</button>
+    </form>
+    <p class="text-[11px] text-csMuted mt-2 flex items-center gap-1.5"><i data-lucide="info" class="w-3 h-3"></i> 3 Mo maximum par fichier — documents, images, audio, vidéo, archives, code...</p>
+</div>
+
+<div class="__CARD__ divide-y divide-csBorder">
+    {% for f in files %}
+    <div class="flex items-center gap-3 p-4">
+        <div class="w-10 h-10 rounded-xl bg-csCard2 border border-csBorder flex items-center justify-center text-lg shrink-0">{{ categories.get(f.category, categories['autre']).icon }}</div>
+        <div class="flex-1 min-w-0">
+            <p class="font-medium text-white text-sm truncate">{{ f.filename }}</p>
+            <p class="text-[11px] text-csMuted truncate">{{ f.description or '' }}</p>
+            <p class="text-[10px] text-csMuted mt-0.5">Par {{ f.username }} · {{ f.size_display }} · {{ f.created_at.split(' ')[0] }}</p>
+        </div>
+        <div class="flex items-center gap-3 shrink-0">
+            <a href="{{ url_for('download_file', company_id=company.id, file_id=f.id) }}" class="text-csIndigo hover:underline text-xs flex items-center gap-1"><i data-lucide="download" class="w-3.5 h-3.5"></i> Télécharger</a>
+            {% if f.uploader_id == session.get('user_id') or perms.manage_files %}
+            <form method="POST" action="{{ url_for('delete_file', company_id=company.id, file_id=f.id) }}" onsubmit="return confirm('Supprimer ce fichier ?');">
+                <button class="text-csMuted hover:text-red-400"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+            </form>
+            {% endif %}
+        </div>
+    </div>
+    {% else %}
+    <div class="p-10 text-center text-csMuted">
+        <i data-lucide="folder-open" class="w-10 h-10 mx-auto mb-3 opacity-40"></i>
+        <p>Aucun fichier pour le moment.</p>
     </div>
     {% endfor %}
 </div>
@@ -1794,6 +2540,82 @@ def delete_message(company_id, message_id):
     return redirect(url_for('messagerie', company_id=company_id))
 
 # ---------------------------------------------------------------------------
+# Routes — Messages privés (Priorité 10, 2e niveau)
+# ---------------------------------------------------------------------------
+
+@app.route('/messages')
+@login_required
+def messages_list():
+    db = get_db()
+    uid = session['user_id']
+    convos = db.execute("""
+        SELECT u.id, u.username, u.display_name, u.avatar_color,
+               (SELECT content FROM private_messages pm
+                WHERE (pm.sender_id = u.id AND pm.recipient_id = ?) OR (pm.sender_id = ? AND pm.recipient_id = u.id)
+                ORDER BY pm.created_at DESC LIMIT 1) AS last_content,
+               (SELECT created_at FROM private_messages pm
+                WHERE (pm.sender_id = u.id AND pm.recipient_id = ?) OR (pm.sender_id = ? AND pm.recipient_id = u.id)
+                ORDER BY pm.created_at DESC LIMIT 1) AS last_at
+        FROM users u
+        WHERE u.id IN (
+            SELECT sender_id FROM private_messages WHERE recipient_id = ?
+            UNION
+            SELECT recipient_id FROM private_messages WHERE sender_id = ?
+        )
+    """, (uid, uid, uid, uid, uid, uid)).fetchall()
+    convos = sorted(convos, key=lambda c: c['last_at'] or '', reverse=True)
+    return render_template_string(MESSAGES_LIST_TEMPLATE, convos=convos, my_companies=get_my_companies())
+
+@app.route('/messages/nouveau', methods=['POST'])
+@login_required
+def start_conversation():
+    username = request.form.get('username', '').strip()
+    other = get_db().execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    if not other:
+        flash('Utilisateur introuvable.', 'error')
+        return redirect(url_for('messages_list'))
+    if other['id'] == session['user_id']:
+        flash('Vous ne pouvez pas vous envoyer un message à vous-même.', 'error')
+        return redirect(url_for('messages_list'))
+    return redirect(url_for('private_conversation', username=other['username']))
+
+@app.route('/messages/<username>', methods=['GET', 'POST'])
+@login_required
+def private_conversation(username):
+    db = get_db()
+    other = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    if not other:
+        flash("Cette personne n'existe pas.", 'error')
+        return redirect(url_for('messages_list'))
+    if other['id'] == session['user_id']:
+        flash('Vous ne pouvez pas vous envoyer un message à vous-même.', 'error')
+        return redirect(url_for('messages_list'))
+
+    if request.method == 'POST':
+        content = request.form.get('content', '').strip()
+        if content:
+            db.execute("INSERT INTO private_messages (sender_id, recipient_id, content) VALUES (?, ?, ?)",
+                       (session['user_id'], other['id'], content))
+            db.commit()
+        return redirect(url_for('private_conversation', username=username))
+
+    thread = db.execute("""
+        SELECT pm.*, u.username, u.avatar_color FROM private_messages pm JOIN users u ON pm.sender_id = u.id
+        WHERE (pm.sender_id = ? AND pm.recipient_id = ?) OR (pm.sender_id = ? AND pm.recipient_id = ?)
+        ORDER BY pm.created_at ASC
+    """, (session['user_id'], other['id'], other['id'], session['user_id'])).fetchall()
+    return render_template_string(PRIVATE_CONVERSATION_TEMPLATE, other=other, thread=thread,
+                                   my_companies=get_my_companies())
+
+@app.route('/messages/<username>/<int:message_id>/supprimer', methods=['POST'])
+@login_required
+def delete_private_message(username, message_id):
+    db = get_db()
+    db.execute("DELETE FROM private_messages WHERE id=? AND sender_id=?", (message_id, session['user_id']))
+    db.commit()
+    return redirect(url_for('private_conversation', username=username))
+
+# ---------------------------------------------------------------------------
 # Routes — Équipe & comptes
 # ---------------------------------------------------------------------------
 
@@ -1997,7 +2819,7 @@ def projets(company_id):
         name = request.form['name'].strip().replace(' ', '-')
         description = request.form.get('description', '').strip()
         is_private = 1 if request.form.get('is_private') else 0
-        category = request.form.get('category', 'Autre').strip() or 'Autre'
+        category = request.form.get('category', '').strip() or PROJECT_CATEGORIES[0]
         image = request.form.get('image', '🚀').strip() or '🚀'
         links = request.form.get('links', '').strip()
         visibility = request.form.get('visibility', 'prive')
@@ -2031,7 +2853,15 @@ def projets(company_id):
         cur.execute("""INSERT INTO projects (company_id, repo_id, created_by, title, category, status, image, links, visibility)
                         VALUES (?, ?, ?, ?, ?, 'idee', ?, ?, ?)""",
                     (company_id, repo_id, session['user_id'], title, category, image, links, visibility))
+        project_id = cur.lastrowid
         db.commit()
+
+        # 5) Modules activés — la sélection cochée dans le formulaire fait
+        # foi telle quelle (y compris vide, ex: type "Libre" sans rien coché
+        # pour l'instant) ; le JS pré-coche déjà un preset à l'ouverture.
+        selected_modules = request.form.getlist('modules')
+        set_project_modules(project_id, selected_modules)
+
         log_activity(company_id, session['user_id'], 'project', f"a lancé le projet {image} « {title} »")
         flash(f'Projet « {title} » créé !', 'success')
         return redirect(url_for('projets', company_id=company_id))
@@ -2042,13 +2872,43 @@ def projets(company_id):
         FROM projects pr JOIN repositories r ON pr.repo_id = r.id JOIN users u ON r.owner_id = u.id
         WHERE pr.company_id=? ORDER BY pr.created_at DESC
     """, (company_id,)).fetchall()
+    projects_list = [dict(p, modules=get_project_modules(p['id'])) for p in projects_list]
     perms = {k: has_perm(company_id, k) for k in PERMISSIONS}
     prefill = request.args.get('titre', '')
     prefill_desc = request.args.get('description', '')
     return render_template_string(PROJETS_TEMPLATE, company=company, projects=projects_list, perms=perms,
                                    minigithub_url=MINIGITHUB_URL, my_companies=get_my_companies(),
                                    categories=PROJECT_CATEGORIES, statuses=dict(PROJECT_STATUSES),
+                                   modules=PROJECT_MODULES, project_types=PROJECT_TYPES,
                                    prefill=prefill, prefill_desc=prefill_desc)
+
+@app.route('/app/<int:company_id>/projets/<int:project_id>/modules', methods=['GET', 'POST'])
+@member_required
+def project_modules_settings(company_id, project_id):
+    db = get_db()
+    company = get_company(company_id)
+    project = db.execute("""
+        SELECT pr.*, r.name AS repo_name FROM projects pr JOIN repositories r ON pr.repo_id = r.id
+        WHERE pr.id=? AND pr.company_id=?
+    """, (project_id, company_id)).fetchone()
+    if not project:
+        flash('Projet introuvable.', 'error')
+        return redirect(url_for('projets', company_id=company_id))
+
+    can_edit = project['created_by'] == session['user_id'] or has_perm(company_id, 'delete_project')
+
+    if request.method == 'POST':
+        if not can_edit:
+            flash('Permission refusée.', 'error')
+            return redirect(url_for('project_modules_settings', company_id=company_id, project_id=project_id))
+        selected_modules = request.form.getlist('modules')
+        set_project_modules(project_id, selected_modules)
+        flash('Modules mis à jour.', 'success')
+        return redirect(url_for('projets', company_id=company_id))
+
+    active_modules = get_project_modules(project_id)
+    return render_template_string(MODULES_TEMPLATE, company=company, project=project, modules=PROJECT_MODULES,
+                                   active_modules=active_modules, can_edit=can_edit, my_companies=get_my_companies())
 
 @app.route('/app/<int:company_id>/projets/<int:project_id>/supprimer', methods=['POST'])
 @permission_required('delete_project')
@@ -2060,6 +2920,10 @@ def delete_project(company_id, project_id):
         db.execute("DELETE FROM branches WHERE repo_id=?", (proj['repo_id'],))
         db.execute("DELETE FROM pull_requests WHERE repo_id=?", (proj['repo_id'],))
         db.execute("DELETE FROM repository_collaborators WHERE repo_id=?", (proj['repo_id'],))
+        db.execute("DELETE FROM tasks WHERE project_id=?", (project_id,))
+        db.execute("DELETE FROM project_messages WHERE project_id=?", (project_id,))
+        db.execute("DELETE FROM company_files WHERE project_id=?", (project_id,))
+        db.execute("DELETE FROM project_modules WHERE project_id=?", (project_id,))
         db.execute("DELETE FROM projects WHERE id=?", (project_id,))
         db.execute("DELETE FROM repositories WHERE id=?", (proj['repo_id'],))
         db.commit()
@@ -2197,6 +3061,9 @@ def project_tasks(company_id, project_id):
     if not project:
         flash('Projet introuvable.', 'error')
         return redirect(url_for('projets', company_id=company_id))
+    if 'taches' not in get_project_modules(project_id):
+        flash("Le module Tâches n'est pas activé pour ce projet.", 'error')
+        return redirect(url_for('projets', company_id=company_id))
 
     if request.method == 'POST':
         title = request.form.get('title', '').strip()
@@ -2234,6 +3101,403 @@ def delete_task(company_id, project_id, task_id):
     db.execute("DELETE FROM tasks WHERE id=? AND project_id=? AND company_id=?", (task_id, project_id, company_id))
     db.commit()
     return redirect(url_for('project_tasks', company_id=company_id, project_id=project_id))
+
+# ---------------------------------------------------------------------------
+# Routes — Maps (module spécifique au domaine "Jeu vidéo")
+# ---------------------------------------------------------------------------
+
+@app.route('/app/<int:company_id>/projets/<int:project_id>/maps', methods=['GET', 'POST'])
+@member_required
+def project_maps(company_id, project_id):
+    db = get_db()
+    company = get_company(company_id)
+    project = db.execute("""
+        SELECT pr.*, r.name AS repo_name FROM projects pr JOIN repositories r ON pr.repo_id = r.id
+        WHERE pr.id=? AND pr.company_id=?
+    """, (project_id, company_id)).fetchone()
+    if not project:
+        flash('Projet introuvable.', 'error')
+        return redirect(url_for('projets', company_id=company_id))
+    if 'maps' not in get_project_modules(project_id):
+        flash("Le module Maps n'est pas activé pour ce projet.", 'error')
+        return redirect(url_for('projets', company_id=company_id))
+
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        version = request.form.get('version', '').strip()
+        emoji = request.form.get('emoji', '🗺️').strip() or '🗺️'
+        notes = request.form.get('notes', '').strip()
+        if name:
+            db.execute("""INSERT INTO game_maps (project_id, name, version, emoji, notes, created_by)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                       (project_id, name, version, emoji, notes, session['user_id']))
+            db.commit()
+            log_activity(company_id, session['user_id'], 'map',
+                         f"a ajouté la carte {emoji} « {name} »" + (f" ({version})" if version else ""))
+            flash('Carte ajoutée.', 'success')
+        return redirect(url_for('project_maps', company_id=company_id, project_id=project_id))
+
+    maps_list = db.execute("SELECT * FROM game_maps WHERE project_id=? ORDER BY created_at DESC",
+                            (project_id,)).fetchall()
+    perms = {k: has_perm(company_id, k) for k in PERMISSIONS}
+    return render_template_string(MAPS_TEMPLATE, company=company, project=project, maps=maps_list,
+                                   perms=perms, my_companies=get_my_companies())
+
+@app.route('/app/<int:company_id>/projets/<int:project_id>/maps/<int:map_id>/supprimer', methods=['POST'])
+@member_required
+def delete_map(company_id, project_id, map_id):
+    db = get_db()
+    m = db.execute("SELECT * FROM game_maps WHERE id=? AND project_id=?", (map_id, project_id)).fetchone()
+    if m and (m['created_by'] == session['user_id'] or has_perm(company_id, 'delete_project')):
+        db.execute("DELETE FROM game_maps WHERE id=?", (map_id,))
+        db.commit()
+        flash('Carte supprimée.', 'success')
+    return redirect(url_for('project_maps', company_id=company_id, project_id=project_id))
+
+# ---------------------------------------------------------------------------
+# Routes — Bugs (module spécifique au domaine "Jeu vidéo")
+# ---------------------------------------------------------------------------
+
+@app.route('/app/<int:company_id>/projets/<int:project_id>/bugs', methods=['GET', 'POST'])
+@member_required
+def project_bugs(company_id, project_id):
+    db = get_db()
+    company = get_company(company_id)
+    project = db.execute("""
+        SELECT pr.*, r.name AS repo_name FROM projects pr JOIN repositories r ON pr.repo_id = r.id
+        WHERE pr.id=? AND pr.company_id=?
+    """, (project_id, company_id)).fetchone()
+    if not project:
+        flash('Projet introuvable.', 'error')
+        return redirect(url_for('projets', company_id=company_id))
+    if 'bugs' not in get_project_modules(project_id):
+        flash("Le module Bugs n'est pas activé pour ce projet.", 'error')
+        return redirect(url_for('projets', company_id=company_id))
+
+    if request.method == 'POST':
+        title = request.form.get('title', '').strip()
+        description = request.form.get('description', '').strip()
+        severity = request.form.get('severity', 'mineur')
+        if severity not in dict(BUG_SEVERITIES):
+            severity = 'mineur'
+        if title:
+            db.execute("""INSERT INTO game_bugs (project_id, company_id, title, description, severity, created_by)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                       (project_id, company_id, title, description, severity, session['user_id']))
+            db.commit()
+            log_activity(company_id, session['user_id'], 'bug', f"a signalé un bug {dict(BUG_SEVERITIES)[severity].split(' ')[0]} « {title} »")
+            flash('Bug signalé.', 'success')
+        return redirect(url_for('project_bugs', company_id=company_id, project_id=project_id))
+
+    bugs = db.execute("SELECT * FROM game_bugs WHERE project_id=? ORDER BY created_at DESC", (project_id,)).fetchall()
+    bugs_by_severity = {}
+    for b in bugs:
+        bugs_by_severity.setdefault(b['severity'] or 'mineur', []).append(b)
+    return render_template_string(BUGS_TEMPLATE, company=company, project=project, bugs_by_severity=bugs_by_severity,
+                                   severities=BUG_SEVERITIES, statuses=BUG_STATUSES, my_companies=get_my_companies())
+
+@app.route('/app/<int:company_id>/projets/<int:project_id>/bugs/<int:bug_id>/statut', methods=['POST'])
+@member_required
+def update_bug_status(company_id, project_id, bug_id):
+    new_status = request.form.get('status', 'ouvert')
+    if new_status not in dict(BUG_STATUSES):
+        new_status = 'ouvert'
+    db = get_db()
+    db.execute("UPDATE game_bugs SET status=? WHERE id=? AND project_id=? AND company_id=?",
+               (new_status, bug_id, project_id, company_id))
+    db.commit()
+    return redirect(url_for('project_bugs', company_id=company_id, project_id=project_id))
+
+@app.route('/app/<int:company_id>/projets/<int:project_id>/bugs/<int:bug_id>/supprimer', methods=['POST'])
+@member_required
+def delete_bug(company_id, project_id, bug_id):
+    db = get_db()
+    b = db.execute("SELECT * FROM game_bugs WHERE id=? AND project_id=?", (bug_id, project_id)).fetchone()
+    if b and (b['created_by'] == session['user_id'] or has_perm(company_id, 'delete_project')):
+        db.execute("DELETE FROM game_bugs WHERE id=?", (bug_id,))
+        db.commit()
+        flash('Bug supprimé.', 'success')
+    return redirect(url_for('project_bugs', company_id=company_id, project_id=project_id))
+
+# ---------------------------------------------------------------------------
+# Routes — Expériences (module spécifique au domaine "Recherche IA")
+# ---------------------------------------------------------------------------
+
+@app.route('/app/<int:company_id>/projets/<int:project_id>/experiences', methods=['GET', 'POST'])
+@member_required
+def project_experiments(company_id, project_id):
+    db = get_db()
+    company = get_company(company_id)
+    project = db.execute("""
+        SELECT pr.*, r.name AS repo_name FROM projects pr JOIN repositories r ON pr.repo_id = r.id
+        WHERE pr.id=? AND pr.company_id=?
+    """, (project_id, company_id)).fetchone()
+    if not project:
+        flash('Projet introuvable.', 'error')
+        return redirect(url_for('projets', company_id=company_id))
+    if 'experiences' not in get_project_modules(project_id):
+        flash("Le module Expériences n'est pas activé pour ce projet.", 'error')
+        return redirect(url_for('projets', company_id=company_id))
+
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        parameters = request.form.get('parameters', '').strip()
+        result = request.form.get('result', '').strip()
+        status = request.form.get('status', 'en_cours')
+        notes = request.form.get('notes', '').strip()
+        if status not in dict(EXPERIMENT_STATUSES):
+            status = 'en_cours'
+        if name:
+            db.execute("""INSERT INTO research_experiments
+                           (project_id, company_id, name, parameters, result, status, notes, created_by)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (project_id, company_id, name, parameters, result, status, notes, session['user_id']))
+            db.commit()
+            log_activity(company_id, session['user_id'], 'experiment', f"a enregistré l'expérience 🧪 « {name} »")
+            flash('Expérience enregistrée.', 'success')
+        return redirect(url_for('project_experiments', company_id=company_id, project_id=project_id))
+
+    experiments = db.execute("SELECT * FROM research_experiments WHERE project_id=? ORDER BY created_at DESC",
+                              (project_id,)).fetchall()
+    return render_template_string(EXPERIMENTS_TEMPLATE, company=company, project=project, experiments=experiments,
+                                   statuses=EXPERIMENT_STATUSES, my_companies=get_my_companies())
+
+@app.route('/app/<int:company_id>/projets/<int:project_id>/experiences/<int:exp_id>/statut', methods=['POST'])
+@member_required
+def update_experiment_status(company_id, project_id, exp_id):
+    new_status = request.form.get('status', 'en_cours')
+    if new_status not in dict(EXPERIMENT_STATUSES):
+        new_status = 'en_cours'
+    db = get_db()
+    db.execute("UPDATE research_experiments SET status=? WHERE id=? AND project_id=? AND company_id=?",
+               (new_status, exp_id, project_id, company_id))
+    db.commit()
+    return redirect(url_for('project_experiments', company_id=company_id, project_id=project_id))
+
+@app.route('/app/<int:company_id>/projets/<int:project_id>/experiences/<int:exp_id>/supprimer', methods=['POST'])
+@member_required
+def delete_experiment(company_id, project_id, exp_id):
+    db = get_db()
+    exp = db.execute("SELECT * FROM research_experiments WHERE id=? AND project_id=?", (exp_id, project_id)).fetchone()
+    if exp and (exp['created_by'] == session['user_id'] or has_perm(company_id, 'delete_project')):
+        db.execute("DELETE FROM research_experiments WHERE id=?", (exp_id,))
+        db.commit()
+        flash('Expérience supprimée.', 'success')
+    return redirect(url_for('project_experiments', company_id=company_id, project_id=project_id))
+
+# ---------------------------------------------------------------------------
+# Routes — Journal de recherche (module spécifique au domaine "Recherche IA")
+# ---------------------------------------------------------------------------
+
+@app.route('/app/<int:company_id>/projets/<int:project_id>/journal', methods=['GET', 'POST'])
+@member_required
+def project_journal(company_id, project_id):
+    db = get_db()
+    company = get_company(company_id)
+    project = db.execute("""
+        SELECT pr.*, r.name AS repo_name FROM projects pr JOIN repositories r ON pr.repo_id = r.id
+        WHERE pr.id=? AND pr.company_id=?
+    """, (project_id, company_id)).fetchone()
+    if not project:
+        flash('Projet introuvable.', 'error')
+        return redirect(url_for('projets', company_id=company_id))
+    if 'journal' not in get_project_modules(project_id):
+        flash("Le module Journal n'est pas activé pour ce projet.", 'error')
+        return redirect(url_for('projets', company_id=company_id))
+
+    if request.method == 'POST':
+        hypothesis = request.form.get('hypothesis', '').strip()
+        experiment = request.form.get('experiment', '').strip()
+        result = request.form.get('result', '').strip()
+        conclusion = request.form.get('conclusion', '').strip()
+        next_step = request.form.get('next_step', '').strip()
+        if hypothesis or experiment or result or conclusion:
+            db.execute("""INSERT INTO research_journal
+                           (project_id, company_id, hypothesis, experiment, result, conclusion, next_step, created_by)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (project_id, company_id, hypothesis, experiment, result, conclusion, next_step, session['user_id']))
+            db.commit()
+            log_activity(company_id, session['user_id'], 'journal', "a ajouté une entrée 📓 au journal de recherche")
+            flash('Entrée ajoutée au journal.', 'success')
+        return redirect(url_for('project_journal', company_id=company_id, project_id=project_id))
+
+    entries = db.execute("""
+        SELECT rj.*, u.username FROM research_journal rj JOIN users u ON rj.created_by = u.id
+        WHERE rj.project_id=? ORDER BY rj.created_at DESC
+    """, (project_id,)).fetchall()
+    perms = {k: has_perm(company_id, k) for k in PERMISSIONS}
+    return render_template_string(JOURNAL_TEMPLATE, company=company, project=project, entries=entries,
+                                   perms=perms, my_companies=get_my_companies())
+
+@app.route('/app/<int:company_id>/projets/<int:project_id>/journal/<int:entry_id>/supprimer', methods=['POST'])
+@member_required
+def delete_journal_entry(company_id, project_id, entry_id):
+    db = get_db()
+    entry = db.execute("SELECT * FROM research_journal WHERE id=? AND project_id=?", (entry_id, project_id)).fetchone()
+    if entry and (entry['created_by'] == session['user_id'] or has_perm(company_id, 'delete_project')):
+        db.execute("DELETE FROM research_journal WHERE id=?", (entry_id,))
+        db.commit()
+        flash('Entrée supprimée.', 'success')
+    return redirect(url_for('project_journal', company_id=company_id, project_id=project_id))
+
+# ---------------------------------------------------------------------------
+# Routes — Discussion de projet (Priorité 10, 3e niveau)
+# ---------------------------------------------------------------------------
+
+def _get_project_or_404(company_id, project_id):
+    return get_db().execute("""
+        SELECT pr.*, r.name AS repo_name FROM projects pr JOIN repositories r ON pr.repo_id = r.id
+        WHERE pr.id=? AND pr.company_id=?
+    """, (project_id, company_id)).fetchone()
+
+@app.route('/app/<int:company_id>/projets/<int:project_id>/discussion', methods=['GET', 'POST'])
+@member_required
+def project_discussion(company_id, project_id):
+    db = get_db()
+    company = get_company(company_id)
+    project = _get_project_or_404(company_id, project_id)
+    if not project:
+        flash('Projet introuvable.', 'error')
+        return redirect(url_for('projets', company_id=company_id))
+    if 'discussion' not in get_project_modules(project_id):
+        flash("Le module Discussion n'est pas activé pour ce projet.", 'error')
+        return redirect(url_for('projets', company_id=company_id))
+
+    if request.method == 'POST':
+        content = request.form.get('content', '').strip()
+        if content:
+            db.execute("""INSERT INTO project_messages (project_id, company_id, user_id, content)
+                           VALUES (?, ?, ?, ?)""", (project_id, company_id, session['user_id'], content))
+            db.commit()
+        return redirect(url_for('project_discussion', company_id=company_id, project_id=project_id))
+
+    messages = db.execute("""
+        SELECT pm.*, u.username, u.avatar_color FROM project_messages pm JOIN users u ON pm.user_id = u.id
+        WHERE pm.project_id=? ORDER BY pm.created_at ASC
+    """, (project_id,)).fetchall()
+    perms = {k: has_perm(company_id, k) for k in PERMISSIONS}
+    return render_template_string(PROJECT_DISCUSSION_TEMPLATE, company=company, project=project, messages=messages,
+                                   perms=perms, my_companies=get_my_companies())
+
+@app.route('/app/<int:company_id>/projets/<int:project_id>/discussion/<int:message_id>/supprimer', methods=['POST'])
+@member_required
+def delete_project_message(company_id, project_id, message_id):
+    db = get_db()
+    msg = db.execute("SELECT * FROM project_messages WHERE id=? AND project_id=? AND company_id=?",
+                      (message_id, project_id, company_id)).fetchone()
+    if msg and (msg['user_id'] == session['user_id'] or has_perm(company_id, 'manage_messaging')):
+        db.execute("DELETE FROM project_messages WHERE id=?", (message_id,))
+        db.commit()
+        flash('Message supprimé.', 'success')
+    return redirect(url_for('project_discussion', company_id=company_id, project_id=project_id))
+
+# ---------------------------------------------------------------------------
+# Routes — Fichiers et documents (Priorité 11)
+# ---------------------------------------------------------------------------
+
+@app.route('/app/<int:company_id>/fichiers', methods=['GET', 'POST'])
+@member_required
+def fichiers(company_id):
+    db = get_db()
+    company = get_company(company_id)
+    project_id = request.args.get('projet', type=int)
+    project = None
+    if project_id:
+        project = _get_project_or_404(company_id, project_id)
+        if not project:
+            flash('Projet introuvable.', 'error')
+            return redirect(url_for('fichiers', company_id=company_id))
+        if 'fichiers' not in get_project_modules(project_id):
+            flash("Le module Fichiers n'est pas activé pour ce projet.", 'error')
+            return redirect(url_for('projets', company_id=company_id))
+
+    if request.method == 'POST':
+        target_project_id = request.form.get('project_id', type=int) or project_id or None
+        redirect_target = (url_for('fichiers', company_id=company_id, projet=target_project_id)
+                            if target_project_id else url_for('fichiers', company_id=company_id))
+        if target_project_id and 'fichiers' not in get_project_modules(target_project_id):
+            flash("Le module Fichiers n'est pas activé pour ce projet.", 'error')
+            return redirect(url_for('projets', company_id=company_id))
+        f = request.files.get('file')
+        if not f or not f.filename:
+            flash('Choisissez un fichier à envoyer.', 'error')
+            return redirect(redirect_target)
+        raw = f.read()
+        if not raw:
+            flash('Le fichier est vide.', 'error')
+            return redirect(redirect_target)
+        if len(raw) > MAX_FILE_SIZE:
+            flash('Fichier trop volumineux (3 Mo maximum).', 'error')
+            return redirect(redirect_target)
+        description = request.form.get('description', '').strip()
+        category = detect_file_category(f.filename)
+        mime_type = f.mimetype or mimetypes.guess_type(f.filename)[0] or 'application/octet-stream'
+        encoded = base64.b64encode(raw).decode('ascii')
+        db.execute("""INSERT INTO company_files
+                       (company_id, project_id, uploader_id, filename, category, mime_type, size_bytes, description, data)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (company_id, target_project_id, session['user_id'], f.filename, category, mime_type,
+                    len(raw), description, encoded))
+        db.commit()
+        log_activity(company_id, session['user_id'], 'file', f"a ajouté le fichier {FILE_CATEGORIES[category]['icon']} « {f.filename} »")
+        flash('Fichier ajouté.', 'success')
+        return redirect(redirect_target)
+
+    if project_id:
+        rows = db.execute("""
+            SELECT cf.*, u.username FROM company_files cf JOIN users u ON cf.uploader_id = u.id
+            WHERE cf.company_id=? AND cf.project_id=? ORDER BY cf.created_at DESC
+        """, (company_id, project_id)).fetchall()
+    else:
+        rows = db.execute("""
+            SELECT cf.*, u.username FROM company_files cf JOIN users u ON cf.uploader_id = u.id
+            WHERE cf.company_id=? ORDER BY cf.created_at DESC
+        """, (company_id,)).fetchall()
+    files_list = []
+    for r in rows:
+        r = dict(r)
+        r['size_display'] = human_size(r['size_bytes'])
+        files_list.append(r)
+
+    projects_list = db.execute("""
+        SELECT pr.id, pr.title, pr.image, r.name AS repo_name FROM projects pr JOIN repositories r ON pr.repo_id = r.id
+        WHERE pr.company_id=? ORDER BY pr.created_at DESC
+    """, (company_id,)).fetchall()
+    projects_list = [p for p in projects_list if 'fichiers' in get_project_modules(p['id'])]
+    perms = {k: has_perm(company_id, k) for k in PERMISSIONS}
+    return render_template_string(FICHIERS_TEMPLATE, company=company, project=project, files=files_list,
+                                   projects_list=projects_list, categories=FILE_CATEGORIES, perms=perms,
+                                   my_companies=get_my_companies())
+
+@app.route('/app/<int:company_id>/fichiers/<int:file_id>/telecharger')
+@member_required
+def download_file(company_id, file_id):
+    row = get_db().execute("SELECT * FROM company_files WHERE id=? AND company_id=?", (file_id, company_id)).fetchone()
+    if not row:
+        flash('Fichier introuvable.', 'error')
+        return redirect(url_for('fichiers', company_id=company_id))
+    raw = base64.b64decode(row['data'])
+    resp = Response(raw, mimetype=row['mime_type'] or 'application/octet-stream')
+    resp.headers['Content-Disposition'] = f'attachment; filename="{row["filename"]}"'
+    return resp
+
+@app.route('/app/<int:company_id>/fichiers/<int:file_id>/supprimer', methods=['POST'])
+@member_required
+def delete_file(company_id, file_id):
+    db = get_db()
+    row = db.execute("SELECT * FROM company_files WHERE id=? AND company_id=?", (file_id, company_id)).fetchone()
+    if not row:
+        flash('Fichier introuvable.', 'error')
+        return redirect(url_for('fichiers', company_id=company_id))
+    project_id = row['project_id']
+    if row['uploader_id'] == session['user_id'] or has_perm(company_id, 'manage_files'):
+        db.execute("DELETE FROM company_files WHERE id=?", (file_id,))
+        db.commit()
+        flash('Fichier supprimé.', 'success')
+    else:
+        flash('Permission refusée.', 'error')
+    return redirect(url_for('fichiers', company_id=company_id, projet=project_id) if project_id
+                     else url_for('fichiers', company_id=company_id))
 
 # ---------------------------------------------------------------------------
 # Routes — Fil d'activité (Priorité 5)
@@ -2396,6 +3660,8 @@ def delete_company(company_id):
     db.execute("DELETE FROM postes WHERE company_id=?", (company_id,))
 
     db.execute("DELETE FROM company_messages WHERE company_id=?", (company_id,))
+    db.execute("DELETE FROM project_messages WHERE company_id=?", (company_id,))
+    db.execute("DELETE FROM company_files WHERE company_id=?", (company_id,))
     db.execute("DELETE FROM companies WHERE id=?", (company_id,))
     db.commit()
 
